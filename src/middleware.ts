@@ -286,9 +286,19 @@ export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): Langu
         // Eager stop: a candidate that is not developing call structure (no
         // complete parameter open yet, so we are not inside a long value) and has
         // grown past the window is prose — flush it and resume scanning fresh.
+        //
+        // Fork guard: NOT while a real block opener is pending (`hasBlockOpen`).
+        // A live `<…tool_calls>`/`<…function_calls>` opener means this is a
+        // genuine envelope whose `parameter` opener may have been dropped by the
+        // provider's mangling (the ~300k long-context shape). Eager-flushing it
+        // here emitted the raw markup verbatim at ~1 KB, pre-empting the 64 KiB
+        // over-cap redaction on the very next branch. Hold to the cap instead so
+        // the runt gets redacted (or recovered once its closer arrives).
+        // Pure prose that only *resembles* an opener (no block opener) still
+        // eager-flushes as before.
         PARAM_OPEN.lastIndex = 0
         const insideValue = PARAM_OPEN.test(textBuffer)
-        if (!final && !overCap && !insideValue && textBuffer.length > EAGER_WINDOW) {
+        if (!final && !overCap && !insideValue && !hasBlockOpen && textBuffer.length > EAGER_WINDOW) {
           captureDrain(captureOn, "aisdk", decision("eager-flush", closed, hasBlockOpen, insideValue, final, start), textBuffer)
           controller.enqueue({ type: "text-delta", id: textId, delta: textBuffer })
           textBuffer = ""

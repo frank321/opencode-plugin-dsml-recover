@@ -405,7 +405,12 @@ export class SseDsmlRewriter {
     }
     PARAM_OPEN.lastIndex = 0
     const insideValue = PARAM_OPEN.test(this.textBuffer)
-    if (!final && !overCap && !insideValue && this.textBuffer.length > EAGER_WINDOW) {
+    // Fork guard: hold while a real block opener is pending (`hasBlockOpen`),
+    // even past the eager window — a mangled long-context envelope may arrive
+    // with its `parameter` opener dropped, and eager-flushing emitted the raw
+    // markup verbatim at ~1 KB, pre-empting the over-cap redaction below.
+    // Prose without a block opener still eager-flushes.
+    if (!final && !overCap && !insideValue && !hasBlockOpen && this.textBuffer.length > EAGER_WINDOW) {
       captureDrain(this.captureOn, "sse", this.decision("eager-flush", closed, hasBlockOpen, insideValue, final, start), this.textBuffer)
       this.emitText(this.textBuffer, out)
       this.textBuffer = ""

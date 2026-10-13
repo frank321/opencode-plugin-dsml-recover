@@ -178,6 +178,41 @@ describe("streaming middleware", () => {
     expect(streamedText(events)).not.toContain("DSML")
   })
 
+  // Regression (2026-10-13): the test above fed all 70 KiB in ONE delta, so the
+  // buffer only ever reached `overCap` and the redaction path ran. Real streams
+  // arrive in small chunks, so the buffer crosses the 1 KB eager window first —
+  // and the old eager-flush guard (`!insideValue`, no `hasBlockOpen` term) then
+  // emitted the raw DSML verbatim, pre-empting the over-cap redaction entirely.
+  // That was the ~300k long-context leak: a live block opener with its
+  // `parameter` opener dropped by provider mangling. Any chunk size below the
+  // whole-body size leaked; these assertions lock the fix.
+  test("stream-buffer-cap redacts the runt when delivered in realistic chunks (fork)", async () => {
+    const huge = tag("tool_calls") + tag("invoke", `name="big"`) + "x".repeat(70 * 1024)
+    for (const size of [4096, 900, 300]) {
+      const chunks: string[] = []
+      for (let i = 0; i < huge.length; i += size) chunks.push(huge.slice(i, i + size))
+      const events = await run(chunks)
+      expect(toolCalls(events)).toHaveLength(0)
+      const out = streamedText(events)
+      expect(out).not.toContain("DSML")
+      expect(out).not.toContain(BAR)
+    }
+  })
+
+  test("stream-eager-open: block opener + dropped parameter opener is held, not flushed raw (fork)", async () => {
+    // The exact escaping shape: outer block opener present, an `invoke` opener,
+    // a long body with NO `parameter name=` opener yet, delivered in chunks.
+    // Must NOT be eager-flushed as visible markup; redacted at the cap instead.
+    const mangled = tag("tool_calls") + "\n" + tag("invoke", `name="edit"`) + "\n" + "y".repeat(8 * 1024)
+    const chunks: string[] = []
+    for (let i = 0; i < mangled.length; i += 250) chunks.push(mangled.slice(i, i + 250))
+    const events = await run(chunks)
+    const out = streamedText(events)
+    expect(toolCalls(events)).toHaveLength(0)
+    expect(out).not.toContain(BAR)
+    expect(out).not.toContain("DSML")
+  })
+
   test("stream-eager-stop: prose opener flushes early, nothing held", async () => {
     // A wrapped-candidate opener that never develops call structure: the hold
     // must release as text (eager stop), not wait for text-end.
