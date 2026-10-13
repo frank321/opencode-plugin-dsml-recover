@@ -103,13 +103,23 @@ only), and the markerless outer opener needing candidate-hold in the stream.
 
 ## 6. Current test state
 
-`bun test` → **39/39 pass** (`test/parse.test.ts` 28/28, `test/stream.test.ts` 11/11).
-`./node_modules/.bin/tsc --noEmit` → clean.
+`bun test` → **114/114 pass** (6 files). `./node_modules/.bin/tsc --noEmit` → clean.
 
-Fixed during this session: the streaming `drain` was flushing partial openers
+Fixed during the streaming work: the streaming `drain` was flushing partial openers
 (`<`, `<BAR`, `<BAR BAR DS`) as text instead of holding them — fixed with
-`partialOpenerSuffix` hold-back (V17). Streaming `emitResolved` no longer strips
-when zero calls were recovered — unclosed/unparseable tails emit verbatim.
+`partialOpenerSuffix` hold-back (V17).
+
+**Fork session (2026-10-13):** two separate fixes on top of upstream 0.2.0 —
+1. **redact unresolved runts** (commit `45282c9`): unclosed/over-cap DSML is
+   redacted, not re-emitted as raw markup.
+2. **hold past the 1 KB eager window while a block opener is pending** (commit
+   `e857663`, this session): the eager-stop guard was missing a `hasBlockOpen`
+   term, so a mangled envelope with a live `tool_calls` opener but **no
+   `parameter` opener** was flushed verbatim at ~1 KB — pre-empting the over-cap
+   redaction. This was **the ~300k long-context leak**, reproduced and fixed.
+   The old `stream-buffer-cap` test passed only because it fed 70 KiB in a single
+   delta; two new **chunked-delivery** regression tests fail on the pre-fix code
+   and pass now (see `test/stream.test.ts`, and `docs/RUNBOOK-FORK.md` §5).
 
 ## 7. Design decisions (locked)
 

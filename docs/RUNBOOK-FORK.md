@@ -19,10 +19,12 @@
 | `capture` option | `src/config.ts`, `src/debug-capture.ts` | NDJSON diagnostics → `/tmp/opencode/dsml-capture.log` |
 | instrumented `drain()` | `src/middleware.ts` (AI-SDK), `src/sse.ts` (SSE) | records every branch decision + buffer length vs cap + held bytes |
 | **redact unresolved runts** | both `emitResolved` + over-cap branches | unclosed/corrupt DSML is **redacted**, not re-emitted as raw markup |
+| **hold past the 1 KB eager window while a block opener is pending** | eager-stop guard in `src/middleware.ts` + `src/sse.ts` (commit `e857663`) | a mangled envelope with a live block opener but no `parameter` opener is no longer flushed verbatim at ~1 KB; it is held to the cap and redacted. Fixes the **~300k leak** (runbook §5) |
 
-Both capture and redaction are **observer/passthrough-safe**: prose never carries
-DSML ranges, so normal text is byte-identical. Verified: `tsc --noEmit` clean,
-**112/112 tests pass**.
+All four changes are **observer/passthrough-safe**: prose never carries DSML
+ranges, so normal text is byte-identical. Verified: `tsc --noEmit` clean,
+**114/114 tests pass** (including two chunked-delivery regression tests for the
+eager-flush fix, which fail on the pre-fix code).
 
 ---
 
@@ -96,8 +98,27 @@ mkdir -p /tmp/opencode
 ls -la /tmp/opencode/dsml-capture.log
 ```
 
-If (a) still shows the npm cache path, the fork did not load — check the JSON
-parses, the `file://` path is exact, and that `dist/index.js` exists.
+> ⚠️ **`loading plugin` is NOT reliable on its own (confirmed 2026-10-13).** Two
+> catch it: (1) the long-running `opencode serve --service` process can predate a
+> config change and keep the **npm-cache** entrypoint in its log lines long after
+> the JSONC was repointed; (2) the **CLI role does not emit a `loading plugin`
+> line at all** — so a fork loaded by an interactive `opencode` run leaves no such
+> line. In this session the journal showed only npm-cache entrypoints while the
+> fork was demonstrably active.
+>
+> **Ground truth is the fork's own log**, written unconditionally at `setup`:
+
+```sh
+# (c) THE reliable check — the fork's own setup breadcrumb.
+#     Only the fork writes this file; the npm-cache dist has no such log path.
+cat /tmp/opencode/dsml-plugin.log
+#   want: recent `[dsml] setup enter dir=…` lines matching your session's start.
+```
+
+If (c) has no recent line, the fork did not load — check the JSONC parses, the
+`file://` path is exact, and that `dist/index.js` exists (and is newer than
+`src/`).
+
 
 ---
 
@@ -123,7 +144,7 @@ for line in sys.stdin:
 
 | Capture signature | Meaning |
 | :--- | :--- |
-| many `branch=eager-flush` at `len≈1024+` | the **1 KB eager window** flushed a held DSML candidate as prose — the suspected ~300k mechanism |
+| many `branch=eager-flush` at `len≈1024+` | the **1 KB eager window** flushed a held DSML candidate as prose — **the ~300k mechanism, now CONFIRMED & FIXED** (see below) |
 | `branch=overcap-flush` | a candidate exceeded **64 KiB** without closing |
 | `emit reason=emit-resolved-unresolved-redacted` | the **fork's fix fired**: a runt was redacted (no raw tags leaked) |
 | `emit reason=over-cap-flush` with `ranges>0` | same, on the over-cap path |
@@ -131,8 +152,21 @@ for line in sys.stdin:
 
 **To answer "is it the small buffer?"**: compare the `len` on leaking events. If
 leaks cluster near **1024** → the eager window, not the 64 KiB cap. If near
-**65536** → the cap. (The earlier offline sweep found **eager-flush**, i.e. the
-1 KB window, not the cap.)
+**65536** → the cap.
+
+> ✅ **RESOLVED (2026-10-13, commit `e857663`).** The offline sweep's guess was
+> right: the leak is the **1 KB eager window**, not the cap. Root cause: the
+> eager-stop guard was `!insideValue` only. When a **live block opener** is
+> present but the mangled envelope has **no `parameter name=` opener yet**
+> (long-context shape), the candidate flushed **verbatim** at ~1 KB — which also
+> **pre-empted** the 64 KiB over-cap redaction (it never got a chance to run).
+> The old `stream-buffer-cap` test passed only because it fed all 70 KiB in **one
+> delta**; any real chunk size leaked all 71,698 raw chars. Fixed by adding
+> `!hasBlockOpen` to the guard (both paths). If capture now shows
+> `branch=hold-continue`/`overcap-flush` where it used to show `eager-flush` for
+> a block-opener candidate, the fix is doing its job. `eager-flush` at `len≈1024`
+> is now legitimate **only** for prose with no block opener.
+
 
 ---
 
@@ -152,6 +186,28 @@ When a leak is suspected:
    middleware to confirm which shape escapes.
 
 This fixture is the input the design doc has been waiting for (§14.4/§15.3).
+
+> **Outcome of the 2026-10-13 capture (recorded here so the next session does not
+> repeat the search).** The capture log captured the repo's long-context session
+> (`ses_ed8b7b4a`, 754,739 input tokens) and **found no leaked envelope in the
+> OpenCode store**: scanning all 11,189 `part` rows for a strong DSML signature
+> (an `invoke`/`parameter` tag) returned **0**; the 14 weak hits were all `tool`
+> parts — grep/read outputs that legitimately quote markup (e.g. Phi's
+> `<<|tool|>>` token discussed in a doc). Real `sse` traffic in the window was
+> 1,559 `emit-plain` + 4 `partial-opener-hold` drains, i.e. **no DSML candidate
+> ever reached the buffer**. So there was no *captured real leak* to fixture.
+>
+> The leak was instead **reproduced from the code + the captured branch shape**:
+> the one `branch=eager-flush` event in the log (a synthetic `aisdk` candidate at
+> `len=1047`, `hasBlockOpen=true`, `insideValue=false`) named the exact failing
+> guard, and a chunked replay of the same structure showed 71,698 raw chars
+> leaking. Two runtime-built regression tests now lock it (runbook §5).
+>
+> **Why no real leak appeared:** two explanations are consistent and both are
+> good news — either the leak simply has not recurred since the fork was wired,
+> or the fork's redaction already strips it before it is stored. Distinguishing
+> them needs a capture window that actually spans a ~300k turn. Keep capturing.
+
 
 ---
 
