@@ -1,0 +1,174 @@
+# RUNBOOK — running the fork and capturing a real DSML leak
+
+> **Fork of `opencode-plugin-dsml-fix`.** This repo adds (a) a diagnostic capture
+> layer and (b) a fix for the residual leak (§16 of
+> `server-manager/docs/DSML_FIX_DESIGN.md`). Read `docs/STATUS.md` first for
+> upstream design history; this file is only about **operating the fork**.
+>
+> ⚠️ **Never write a literal DSML token into a source or doc file.** The
+> client/provider may parse it as a phantom tool call. Build tags at runtime
+> (`test/fixtures.ts`) or use the `‹DSML›` placeholder. This applies to anything
+> you paste into logs, docs, or fixtures.
+
+---
+
+## 1. What the fork adds over upstream 0.2.0
+
+| Change | Where | Effect |
+| :--- | :--- | :--- |
+| `capture` option | `src/config.ts`, `src/debug-capture.ts` | NDJSON diagnostics → `/tmp/opencode/dsml-capture.log` |
+| instrumented `drain()` | `src/middleware.ts` (AI-SDK), `src/sse.ts` (SSE) | records every branch decision + buffer length vs cap + held bytes |
+| **redact unresolved runts** | both `emitResolved` + over-cap branches | unclosed/corrupt DSML is **redacted**, not re-emitted as raw markup |
+
+Both capture and redaction are **observer/passthrough-safe**: prose never carries
+DSML ranges, so normal text is byte-identical. Verified: `tsc --noEmit` clean,
+**112/112 tests pass**.
+
+---
+
+## 2. Build
+
+The upstream project builds with **bun**; `dist/` is gitignored, so **you must
+build before OpenCode can load it**.
+
+```sh
+cd /Users/frank/git_repo/opencode-plugin-dsml-fix
+export PATH="$HOME/.bun/bin:$PATH"        # bun 1.4.x
+bun install                                # once (types + deps)
+npx --yes esbuild ./src/index.ts --bundle --format=esm --target=esnext \
+  --platform=node --external:@opencode/plugin --external:@ai-sdk/provider \
+  --outfile=./dist/index.js --banner:js='// @bun'
+```
+
+> `bun run build` also works and is the canonical command; the `esbuild` line is
+> the equivalent used here when bun's build wrapper is unavailable. Output is a
+> single ESM file (~47 KB). Confirm: `ls -la dist/index.js`.
+
+**Rebuild after every `src/` edit** — OpenCode loads `dist/index.js`, never `src/`.
+
+---
+
+## 3. Point OpenCode at the fork
+
+`~/.config/opencode/opencode.jsonc`:
+
+```jsonc
+"plugins": [
+  {
+    "package": "file:///Users/frank/git_repo/opencode-plugin-dsml-fix",
+    "options": {
+      "providers": ["deepinfra"],
+      "debug": false,
+      "capture": true
+    }
+  }
+],
+```
+
+- The loader accepts a **`file://` URL to the plugin directory** (it resolves the
+  entrypoint via `package.json` `exports` → `./dist/index.js`). Absolute paths and
+  `./relative` also work.
+- `capture: true` turns on the NDJSON diagnostics. `debug: true` adds upstream's
+  per-turn summary lines (separate; both are harmless).
+- **Back up before editing**: `cp opencode.jsonc opencode.jsonc.bak.$(date +%Y%m%d_%H%M%S)`.
+
+### Does a running session pick it up?
+
+OpenCode watches configured plugin sources and re-activates on change
+(`packages/core/src/plugin/supervisor.ts`), **but** a session already in flight
+had its hooks bound at activation. **Start a NEW session** (or restart the
+OpenCode app/server) to be certain the fork is what's loaded.
+
+---
+
+## 4. Confirm the fork is live
+
+After starting a fresh session:
+
+```sh
+# (a) the loader logs the entrypoint — must point at the FORK, not the npm cache
+grep -a "loading plugin" ~/.local/share/opencode/log/opencode.log | tail -3
+#   want: entrypoint=file:///Users/frank/git_repo/opencode-plugin-dsml-fix/...
+#   NOT:  entrypoint=file:///Users/frank/.cache/opencode/npm/opencode-plugin-dsml-fix@latest/...
+
+# (b) the capture file grows once the fork sees a turn with a DSML candidate
+mkdir -p /tmp/opencode
+ls -la /tmp/opencode/dsml-capture.log
+```
+
+If (a) still shows the npm cache path, the fork did not load — check the JSON
+parses, the `file://` path is exact, and that `dist/index.js` exists.
+
+---
+
+## 5. Watching for a leak
+
+Run this in a second terminal while you work in OpenCode:
+
+```sh
+# live tail, one readable line per event
+tail -f /tmp/opencode/dsml-capture.log | python3 -c '
+import sys, json
+for line in sys.stdin:
+    try: d = json.loads(line)
+    except Exception: continue
+    if d["ev"] == "drain":
+        print(f"[drain] {d[\"branch\"]:<18} len={d[\"len\"]:<7} closed={d[\"closed\"]} insideValue={d[\"insideValue\"]} overCap={d[\"overCap\"]}")
+    elif d["ev"] == "emit":
+        print(f"[emit]  {d[\"reason\"]} recovered={d.get(\"recoveredCalls\")} names={d.get(\"names\")} len={d[\"text\"][\"len\"]}")
+'
+```
+
+### What signals a leak at ~300k context
+
+| Capture signature | Meaning |
+| :--- | :--- |
+| many `branch=eager-flush` at `len≈1024+` | the **1 KB eager window** flushed a held DSML candidate as prose — the suspected ~300k mechanism |
+| `branch=overcap-flush` | a candidate exceeded **64 KiB** without closing |
+| `emit reason=emit-resolved-unresolved-redacted` | the **fork's fix fired**: a runt was redacted (no raw tags leaked) |
+| `emit reason=over-cap-flush` with `ranges>0` | same, on the over-cap path |
+| `emit reason=emit-resolved-no-call` with `ranges=0` | **plain prose** — not a leak |
+
+**To answer "is it the small buffer?"**: compare the `len` on leaking events. If
+leaks cluster near **1024** → the eager window, not the 64 KiB cap. If near
+**65536** → the cap. (The earlier offline sweep found **eager-flush**, i.e. the
+1 KB window, not the cap.)
+
+---
+
+## 6. Capturing a real fixture (the goal)
+
+When a leak is suspected:
+
+1. Note the **wall-clock time** and keep working — do **not** clear the session.
+2. Grab the offending turn's raw bytes from the **capture log** — the `emit`
+   records carry `text.head`/`text.tail` (600 chars each) plus exact length.
+3. For full fidelity, pull the raw assistant text from the **OpenCode session
+   store** around that timestamp:
+   `sqlite3 ~/.local/share/opencode/opencode.db "SELECT ... FROM part ..."`
+   (`part` holds assistant text; `message` holds metadata).
+4. Save it as a **test fixture built at runtime** (never a literal token in a
+   file — see the warning at the top). Replay through `parseDsml` and the
+   middleware to confirm which shape escapes.
+
+This fixture is the input the design doc has been waiting for (§14.4/§15.3).
+
+---
+
+## 7. Safety / hygiene
+
+- The capture log may contain **your session text**. It lives in `/tmp`
+  (world-readable on some setups). Delete it when done: `rm -f /tmp/opencode/dsml-capture.log`.
+- Never commit `dist/`, `node_modules/`, or the capture log (already gitignored).
+- No secrets are involved; the plugin reads no credentials.
+
+## 8. Rollback
+
+```sh
+# 1. restore the config
+cp ~/.config/opencode/opencode.jsonc.bak.<TIMESTAMP> ~/.config/opencode/opencode.jsonc
+# 2. start a new session (or restart the app/server)
+```
+
+Removing the `plugins` entry (or restoring the `"package": "opencode-plugin-dsml-fix"`
+npm form) reverts to the unpatched plugin. The fork changes nothing outside itself.
