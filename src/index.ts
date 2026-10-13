@@ -98,6 +98,7 @@ export default Plugin.define({
           stream: true,
           generate: true,
           bufferLimit: config.bufferLimit,
+          capture: config.capture,
           onSettled: (stats) => {
             const what =
               stats.calls > 0 ? `recovered=${stats.calls}` : stats.sawCandidate ? "held-candidate-no-call" : "passthrough"
@@ -126,6 +127,7 @@ export default Plugin.define({
           event.response = rewriteSseResponse(event.response, {
             ...parseOptions,
             bufferLimit: config.bufferLimit,
+            capture: config.capture,
             onSettled: (stats) => {
               const what =
                 stats.calls > 0

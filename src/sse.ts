@@ -19,13 +19,16 @@
  * policy as the AI-SDK middleware.
  */
 
-import { parseDsml, type DsmlToolCall, type ParseOptions } from "./parse.ts"
+import { parseDsml, redactionNote, stripRangesWithNote, type DsmlToolCall, type ParseOptions } from "./parse.ts"
+import { captureDelta, captureDrain, captureEmit, type DrainDecision } from "./debug-capture.ts"
 
 export interface SseRewriterOptions extends ParseOptions {
   /** Streaming swallow cap in bytes. Default 65536. */
   readonly bufferLimit?: number
   /** Called once when the stream closes, with the per-turn outcome. */
   readonly onSettled?: (stats: SseStats) => void
+  /** LOCAL FORK: write capture records to /tmp/opencode/dsml-capture.log. */
+  readonly capture?: boolean
 }
 
 /** Per-turn outcome for logging: what the rewrite actually did. */
@@ -151,10 +154,12 @@ export class SseDsmlRewriter {
   private readonly bufferLimit: number
   private readonly parseOptions: ParseOptions
   private readonly onSettled?: (stats: SseStats) => void
+  private readonly captureOn: boolean
 
   constructor(input?: SseRewriterOptions) {
     this.bufferLimit = input?.bufferLimit ?? DEFAULT_BUFFER_LIMIT
     this.onSettled = input?.onSettled
+    this.captureOn = input?.capture ?? false
     this.parseOptions = {
       orphanInvoke: input?.orphanInvoke,
       looseParameters: input?.looseParameters,
@@ -222,6 +227,7 @@ export class SseDsmlRewriter {
       const hasMore = finish !== undefined || Object.keys(deltaRest).length > 0 || choices.length > 1
       if (content !== undefined) {
         this.textBuffer += content
+        captureDelta(this.captureOn, "sse", this.textBuffer.length, content.length, this.bufferLimit)
         out.push(...this.drain(false))
       }
       if (finish !== undefined) {
@@ -264,6 +270,25 @@ export class SseDsmlRewriter {
     const { calls, ranges } = parseDsml(this.textBuffer, this.parseOptions)
     this.textBuffer = ""
     if (calls.length === 0) {
+      // Fork (openclaw lesson): an unresolved DSML *runt* (ranges present, no
+      // recoverable call) must be DROPPED, not echoed — echoing leaks raw tags.
+      // Prose never carries ranges, so it passes through unchanged.
+      if (ranges.length > 0) {
+        const redacted = stripRangesWithNote(original, ranges, redactionNote([]))
+        captureEmit(this.captureOn, "sse", "emit-resolved-unresolved-redacted", redacted, {
+          final,
+          recoveredCalls: 0,
+          ranges: ranges.length,
+          cap: this.bufferLimit,
+        })
+        this.emitText(redacted, out)
+        return
+      }
+      captureEmit(this.captureOn, "sse", "emit-resolved-no-call", original, {
+        final,
+        recoveredCalls: 0,
+        cap: this.bufferLimit,
+      })
       this.emitText(original, out)
       return
     }
@@ -286,6 +311,12 @@ export class SseDsmlRewriter {
       }
     }
     this.emitText(cleaned, out)
+    captureEmit(this.captureOn, "sse", "emit-resolved", cleaned, {
+      final,
+      recoveredCalls: calls.length,
+      names: calls.map((c) => c.name),
+      originalLen: original.length,
+    })
     for (const call of calls) {
       // Allocate synthetic indexes above every native index observed so far.
       // The native parser keys accumulation by `index` (falling back from `id`),
@@ -307,6 +338,29 @@ export class SseDsmlRewriter {
     return stripped.length === 0 && text.length > 0
   }
 
+  /** Build a capture decision from the current buffer (read-only). */
+  private decision(
+    branch: DrainDecision["branch"],
+    closed: boolean,
+    hasBlockOpen: boolean,
+    insideValue: boolean,
+    final: boolean,
+    start: number,
+  ): DrainDecision {
+    return {
+      len: this.textBuffer.length,
+      cap: this.bufferLimit,
+      holdStart: start,
+      closed,
+      hasBlockOpen,
+      insideValue,
+      overCap: this.textBuffer.length > this.bufferLimit,
+      overEager: this.textBuffer.length > EAGER_WINDOW,
+      branch,
+      final,
+    }
+  }
+
   private drain(final: boolean): string[] {
     const out: string[] = []
     if (!this.textBuffer) return out
@@ -315,6 +369,7 @@ export class SseDsmlRewriter {
       const keep = final ? 0 : partialOpenerSuffix(this.textBuffer)
       if (keep > 0) {
         this.sawCandidate = true
+        captureDrain(this.captureOn, "sse", this.decision("partial-opener-hold", false, false, false, final, start), this.textBuffer)
         const emit = this.textBuffer.slice(0, this.textBuffer.length - keep)
         this.textBuffer = this.textBuffer.slice(this.textBuffer.length - keep)
         this.emitText(emit, out)
@@ -323,9 +378,11 @@ export class SseDsmlRewriter {
       if (this.recoveredInBlock && this.isMarkupNoise(this.textBuffer)) {
         // NB: recoveredInBlock stays true for the rest of this text block —
         // later closer fragments (`</calls>` split across chunks) must still drop.
+        captureDrain(this.captureOn, "sse", this.decision("markup-noise-drop", false, false, false, final, start), this.textBuffer)
         this.textBuffer = ""
         return out
       }
+      captureDrain(this.captureOn, "sse", this.decision("emit-plain", false, false, false, final, start), this.textBuffer)
       this.emitText(this.textBuffer, out)
       this.textBuffer = ""
       return out
@@ -342,22 +399,34 @@ export class SseDsmlRewriter {
       (!hasBlockOpen && /<\/[\uFF5C|]{1,2}\s*DSML\s*[\uFF5C|]{1,2}\s*(?:invoke|calls)\s*>/iu.test(this.textBuffer))
     const overCap = this.textBuffer.length > this.bufferLimit
     if (!final && closed) {
+      captureDrain(this.captureOn, "sse", this.decision("resolved-closed", closed, hasBlockOpen, false, final, start), this.textBuffer)
       this.emitResolved(out, false)
       return out
     }
     PARAM_OPEN.lastIndex = 0
     const insideValue = PARAM_OPEN.test(this.textBuffer)
     if (!final && !overCap && !insideValue && this.textBuffer.length > EAGER_WINDOW) {
+      captureDrain(this.captureOn, "sse", this.decision("eager-flush", closed, hasBlockOpen, insideValue, final, start), this.textBuffer)
       this.emitText(this.textBuffer, out)
       this.textBuffer = ""
       return out
     }
-    if (!final && !overCap) return out
+    if (!final && !overCap) {
+      captureDrain(this.captureOn, "sse", this.decision("hold-continue", closed, hasBlockOpen, insideValue, final, start), this.textBuffer)
+      return out
+    }
     if (overCap && !closed) {
-      this.emitText(this.textBuffer, out)
+      captureDrain(this.captureOn, "sse", this.decision("overcap-flush", closed, hasBlockOpen, insideValue, final, start), this.textBuffer)
+      // Fork (openclaw lesson): redact an over-cap runt instead of emitting raw
+      // markup — the verbatim flush is a primary DSML leak path.
+      const { ranges: overRanges } = parseDsml(this.textBuffer, this.parseOptions)
+      const redacted = overRanges.length > 0 ? stripRangesWithNote(this.textBuffer, overRanges, redactionNote([])) : this.textBuffer
+      captureEmit(this.captureOn, "sse", "over-cap-flush", redacted, { cap: this.bufferLimit, len: this.textBuffer.length, ranges: overRanges.length })
+      this.emitText(redacted, out)
       this.textBuffer = ""
       return out
     }
+    captureDrain(this.captureOn, "sse", this.decision("resolved-final", closed, hasBlockOpen, insideValue, final, start), this.textBuffer)
     this.emitResolved(out, true)
     return out
   }

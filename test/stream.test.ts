@@ -133,12 +133,15 @@ describe("streaming middleware", () => {
     expect(toolCalls(events)[0]!.toolName).toBe("bash")
   })
 
-  test("stream-truncated-invoke falls back to text", async () => {
-    // Opener plus an invoke that never closes: nothing usable, so flush verbatim.
+  test("stream-truncated-invoke is redacted, not leaked (fork)", async () => {
+    // Opener plus an invoke that never closes: nothing usable. The fork DROPS the
+    // runt (openclaw lesson) instead of re-emitting raw markup — flushing verbatim
+    // is exactly what leaks DSML tags into the chat at long context.
     const deltas = [tag("tool_calls"), tag("invoke", 'name="bash"'), param("command", "pwd")]
     const events = await run(deltas)
     expect(toolCalls(events)).toHaveLength(0)
-    expect(streamedText(events)).toContain("DSML")
+    expect(streamedText(events)).not.toContain("DSML")
+    expect(streamedText(events)).toContain("[removed malformed markup]")
     expect(finishOf(events).finishReason.unified).toBe("stop")
   })
 
@@ -167,11 +170,12 @@ describe("streaming middleware", () => {
     expect(lifecycle(events)).toEqual(["tool-input-start", "tool-input-delta", "tool-input-end"])
   })
 
-  test("stream-buffer-cap falls back to text", async () => {
+  test("stream-buffer-cap redacts the runt (fork)", async () => {
     const huge = tag("tool_calls") + "x".repeat(70 * 1024)
     const events = await run([huge])
     expect(toolCalls(events)).toHaveLength(0)
-    expect(streamedText(events)).toContain("DSML")
+    // Fork: the over-cap runt is redacted, not echoed as raw markup.
+    expect(streamedText(events)).not.toContain("DSML")
   })
 
   test("stream-eager-stop: prose opener flushes early, nothing held", async () => {

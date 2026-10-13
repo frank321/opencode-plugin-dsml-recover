@@ -62,8 +62,17 @@ export interface DsmlPluginOptions {
      */
     channel?: "system" | "user"
   }
-  /** Log recoveries to stderr. Default false. The only off-by-default flag. */
+  /** Log recoveries to stderr. Default false. Off-by-default. */
   debug?: boolean
+  /**
+   * LOCAL FORK DIAGNOSTIC: capture the leaked BYTES and buffer sizes of every
+   * DSML candidate to `/tmp/opencode/dsml-capture.log` (NDJSON). Unlike `debug`
+   * (per-turn summaries only), this records the `drain()` decision, the exact
+   * buffer length, and the over-cap path — enough to tell whether the long-
+   * context failure is a too-small `bufferLimit` or a malformed shape.
+   * Observer only: never changes what is emitted. Default false.
+   */
+  capture?: boolean
 }
 
 export interface ResolvedDsmlConfig {
@@ -79,6 +88,7 @@ export interface ResolvedDsmlConfig {
   readonly retryNudgeEnabled: boolean
   readonly retryChannel: "system" | "user"
   readonly debug: boolean
+  readonly capture: boolean
 }
 
 const DEFAULT_PROVIDERS = ["opencode-go", "opencode"] as const
@@ -101,6 +111,7 @@ export function resolveConfig(input: DsmlPluginOptions = {}): ResolvedDsmlConfig
     retryNudgeEnabled: retry.nudge ?? true,
     retryChannel: retry.channel ?? "system",
     debug: input.debug ?? false,
+    capture: input.capture ?? false,
   }
 }
 

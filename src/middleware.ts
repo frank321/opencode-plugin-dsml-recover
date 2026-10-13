@@ -21,7 +21,8 @@ import type {
   LanguageModelV3Middleware,
   LanguageModelV3StreamPart,
 } from "@ai-sdk/provider"
-import { parseDsml, type DsmlToolCall, type ParseOptions } from "./parse.ts"
+import { parseDsml, redactionNote, stripRangesWithNote, type DsmlToolCall, type ParseOptions } from "./parse.ts"
+import { captureDelta, captureDrain, captureEmit, type DrainDecision } from "./debug-capture.ts"
 
 export interface DsmlMiddlewareOptions extends ParseOptions {
   /** Streaming swallow cap in bytes. Default 65536. */
@@ -32,6 +33,8 @@ export interface DsmlMiddlewareOptions extends ParseOptions {
   readonly generate?: boolean
   /** Called once when the stream ends, with the per-turn outcome. */
   readonly onSettled?: (stats: DsmlStats) => void
+  /** LOCAL FORK: write capture records to /tmp/opencode/dsml-capture.log. */
+  readonly capture?: boolean
 }
 
 /** Per-turn outcome for logging: what the middleware actually did. */
@@ -139,6 +142,7 @@ export function recoverFromText(
 
 export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): LanguageModelV3Middleware {
   const bufferLimit = input?.bufferLimit ?? DEFAULT_BUFFER_LIMIT
+  const captureOn = input?.capture ?? false
   const parseOptions: ParseOptions = {
     orphanInvoke: input?.orphanInvoke,
     looseParameters: input?.looseParameters,
@@ -157,6 +161,32 @@ export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): Langu
       let sawCandidate = false
       let settled = false
       let counter = 0
+
+      /**
+       * Build a capture decision from the current buffer state. `start` and
+       * `final` are passed in because they are already computed at each branch;
+       * everything else is re-derived here, so this helper can never change
+       * behaviour (it only reads).
+       */
+      const decision = (
+        branch: DrainDecision["branch"],
+        closed: boolean,
+        hasBlockOpen: boolean,
+        insideValue: boolean,
+        final: boolean,
+        start: number,
+      ): DrainDecision => ({
+        len: textBuffer.length,
+        cap: bufferLimit,
+        holdStart: start,
+        closed,
+        hasBlockOpen,
+        insideValue,
+        overCap: textBuffer.length > bufferLimit,
+        overEager: textBuffer.length > EAGER_WINDOW,
+        branch,
+        final,
+      })
 
       const settle = () => {
         if (settled) return
@@ -206,6 +236,7 @@ export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): Langu
           const keep = final ? 0 : partialOpenerSuffix(textBuffer)
           if (keep > 0) {
             sawCandidate = true
+            captureDrain(captureOn, "aisdk", decision("partial-opener-hold", false, false, false, final, start), textBuffer)
             const emit = textBuffer.slice(0, textBuffer.length - keep)
             textBuffer = textBuffer.slice(textBuffer.length - keep)
             if (emit.length > 0) controller.enqueue({ type: "text-delta", id: textId, delta: emit })
@@ -215,9 +246,11 @@ export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): Langu
           // `</invoke>` / `</calls>` that arrived in a later chunk) is dropped
           // rather than leaked: it is pure closers, never prose.
           if (recoveredInBlock && isMarkupNoise(textBuffer)) {
+            captureDrain(captureOn, "aisdk", decision("markup-noise-drop", false, false, false, final, start), textBuffer)
             textBuffer = ""
             return
           }
+          captureDrain(captureOn, "aisdk", decision("emit-plain", false, false, false, final, start), textBuffer)
           controller.enqueue({ type: "text-delta", id: textId, delta: textBuffer })
           textBuffer = ""
           return
@@ -246,6 +279,7 @@ export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): Langu
             /<\/[\uFF5C|]{1,2}\s*DSML\s*[\uFF5C|]{1,2}\s*(?:invoke|calls)\s*>/iu.test(textBuffer))
         const overCap = textBuffer.length > bufferLimit
         if (!final && closed) {
+          captureDrain(captureOn, "aisdk", decision("resolved-closed", closed, hasBlockOpen, false, final, start), textBuffer)
           emitResolved(controller, textId, false)
           return
         }
@@ -255,29 +289,63 @@ export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): Langu
         PARAM_OPEN.lastIndex = 0
         const insideValue = PARAM_OPEN.test(textBuffer)
         if (!final && !overCap && !insideValue && textBuffer.length > EAGER_WINDOW) {
+          captureDrain(captureOn, "aisdk", decision("eager-flush", closed, hasBlockOpen, insideValue, final, start), textBuffer)
           controller.enqueue({ type: "text-delta", id: textId, delta: textBuffer })
           textBuffer = ""
           return
         }
         // Nothing complete yet and we are still streaming: hold, until the cap.
-        if (!final && !overCap) return
+        if (!final && !overCap) {
+          captureDrain(captureOn, "aisdk", decision("hold-continue", closed, hasBlockOpen, insideValue, final, start), textBuffer)
+          return
+        }
         // Final, over-cap, or unresolved at end: emit everything (recovering any
         // complete calls that do exist, but never swallowing an unclosed tail).
         if (overCap && !closed) {
-          controller.enqueue({ type: "text-delta", id: textId, delta: textBuffer })
+          captureDrain(captureOn, "aisdk", decision("overcap-flush", closed, hasBlockOpen, insideValue, final, start), textBuffer)
+          // Fork (openclaw lesson): a held DSML candidate that blew the cap and
+          // never closed is a runt — redact it rather than emitting raw markup.
+          // The old verbatim flush is a primary way DSML tags reach the chat.
+          const { ranges: overRanges } = parseDsml(textBuffer, parseOptions)
+          const redacted = overRanges.length > 0 ? stripRangesWithNote(textBuffer, overRanges, redactionNote([])) : textBuffer
+          captureEmit(captureOn, "aisdk", "over-cap-flush", redacted, { cap: bufferLimit, len: textBuffer.length, ranges: overRanges.length })
+          if (redacted.length > 0) controller.enqueue({ type: "text-delta", id: textId, delta: redacted })
           textBuffer = ""
           return
         }
+        captureDrain(captureOn, "aisdk", decision("resolved-final", closed, hasBlockOpen, insideValue, final, start), textBuffer)
         emitResolved(controller, textId, true)
       }
 
       const emitResolved = (controller: TransformStreamDefaultController<LanguageModelV3StreamPart>, textId: string, isFinal: boolean) => {
         const original = textBuffer
         const { calls, text } = recoverFromText(textBuffer, parseOptions)
+        // Ranges parseDsml asked us to remove. Present even when no call was
+        // recovered (an unclosed/corrupt block strips to end-of-text, V15).
+        const { ranges } = parseDsml(original, parseOptions)
         textBuffer = ""
-        // Streaming rule: never strip unless we recovered something. An unclosed or
-        // unparseable tail is emitted verbatim so no content is lost mid-stream.
+        // Recovery rule: strip only when we recovered a call OR the buffer is
+        // recognisably DSML *markup* with nothing to recover. The second clause
+        // is the openclaw lesson (fork): an unclosed/runt block must be DROPPED,
+        // not re-emitted — re-emitting is what leaks raw tags into the chat at
+        // long context. Genuine prose never carries `ranges`, so it is untouched.
         if (calls.length === 0) {
+          if (ranges.length > 0) {
+            const redacted = stripRangesWithNote(original, ranges, redactionNote([]))
+            captureEmit(captureOn, "aisdk", "emit-resolved-unresolved-redacted", redacted, {
+              final: isFinal,
+              recoveredCalls: 0,
+              ranges: ranges.length,
+              cap: bufferLimit,
+            })
+            if (redacted.length > 0) controller.enqueue({ type: "text-delta", id: textId, delta: redacted })
+            return
+          }
+          captureEmit(captureOn, "aisdk", "emit-resolved-no-call", original, {
+            final: isFinal,
+            recoveredCalls: 0,
+            cap: bufferLimit,
+          })
           controller.enqueue({ type: "text-delta", id: textId, delta: original })
           return
         }
@@ -292,6 +360,12 @@ export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): Langu
             cleaned = cleaned.slice(0, cleaned.length - holdBack)
           }
         }
+        captureEmit(captureOn, "aisdk", "emit-resolved", cleaned, {
+          final: isFinal,
+          recoveredCalls: calls.length,
+          names: calls.map((c) => c.name),
+          originalLen: original.length,
+        })
         if (cleaned.length > 0) controller.enqueue({ type: "text-delta", id: textId, delta: cleaned })
         for (const call of calls) enqueueCall(controller, call)
       }
@@ -334,6 +408,7 @@ export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): Langu
               const id = chunk.id
               if (activeTextId === null) activeTextId = id
               textBuffer += chunk.delta
+              captureDelta(captureOn, "aisdk", textBuffer.length, chunk.delta.length, bufferLimit)
               drain(controller, id, false)
             },
             flush(controller) {
