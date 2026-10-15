@@ -34,7 +34,7 @@ The upstream project builds with **bun**; `dist/` is gitignored, so **you must
 build before OpenCode can load it**.
 
 ```sh
-cd /Users/frank/git_repo/opencode-plugin-dsml-fix
+cd /Users/frank/git_repo/opencode-plugin-dsml-recover
 export PATH="$HOME/.bun/bin:$PATH"        # bun 1.4.x
 bun install                                # once (types + deps)
 npx --yes esbuild ./src/index.ts --bundle --format=esm --target=esnext \
@@ -57,7 +57,7 @@ npx --yes esbuild ./src/index.ts --bundle --format=esm --target=esnext \
 ```jsonc
 "plugins": [
   {
-    "package": "file:///Users/frank/git_repo/opencode-plugin-dsml-fix",
+    "package": "file:///Users/frank/git_repo/opencode-plugin-dsml-recover",
     "options": {
       "providers": ["deepinfra"],
       "debug": false,
@@ -90,7 +90,7 @@ After starting a fresh session:
 ```sh
 # (a) the loader logs the entrypoint — must point at the FORK, not the npm cache
 grep -a "loading plugin" ~/.local/share/opencode/log/opencode.log | tail -3
-#   want: entrypoint=file:///Users/frank/git_repo/opencode-plugin-dsml-fix/...
+#   want: entrypoint=file:///Users/frank/git_repo/opencode-plugin-dsml-recover/...
 #   NOT:  entrypoint=file:///Users/frank/.cache/opencode/npm/opencode-plugin-dsml-fix@latest/...
 
 # (b) the capture file grows once the fork sees a turn with a DSML candidate

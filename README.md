@@ -1,4 +1,4 @@
-# opencode-plugin-dsml-fix
+# opencode-plugin-dsml-recover
 
 Recovers DeepSeek DSML tool calls that leak into assistant text. OpenCode V2 plugin.
 
@@ -67,7 +67,11 @@ Read this before touching any setting. Two sources: my own long sessions on
 ## Install
 
 ```sh
+# from npm (upstream name; our fork is not published yet)
 opencode plugin add opencode-plugin-dsml-fix
+
+# local fork (what we run): point the config at the checkout
+#   "package": "file:///Users/frank/git_repo/opencode-plugin-dsml-recover"
 ```
 
 - Requires OpenCode V2 (`2.0.x`).
@@ -105,7 +109,7 @@ Object form in `opencode.jsonc`:
 {
   "plugins": [
     {
-      "package": "opencode-plugin-dsml-fix",
+      "package": "file:///Users/frank/git_repo/opencode-plugin-dsml-recover",
       "options": {
         "parse": { "wrappedTool": false },
         "retry": { "maxAttempts": 5 },
