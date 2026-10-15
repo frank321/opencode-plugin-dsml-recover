@@ -2,6 +2,27 @@
 
 Recovers DeepSeek DSML tool calls that leak into assistant text. OpenCode V2 plugin.
 
+> ## Fork notice
+>
+> This is a **fork of [`bendtherules/opencode-plugin-dsml-fix`](https://github.com/bendtherules/opencode-plugin-dsml-fix)**
+> (v0.2.0, MIT) — by **frank321**. The original plugin's buffering / parse /
+> recover architecture is **bendtherules'** work and is used unchanged. All credit
+> for the design is theirs; see [`LICENSE`](./LICENSE) (dual copyright) and the
+> attribution in [`docs/FIX-eager-flush.md`](./docs/FIX-eager-flush.md) §8.
+>
+> **What this fork adds** (all upstream-safe; prose stays byte-identical):
+>
+> 1. **Fix — eager-flush leak of mangled envelopes at long context.** Two
+>    co-requisite changes: (a) hold past the 1 KB eager window while a block
+>    opener is pending, and (b) **redact** an unresolved runt at the cap instead
+>    of emitting raw markup. Fixes the ~300k-token leak. → `docs/FIX-eager-flush.md`
+> 2. **Diagnostics capture** (off by default): NDJSON of every stream decision to
+>    `/tmp/opencode/dsml-capture.log`, to catch a leak in the act.
+>    → `docs/RUNBOOK-FORK.md`
+>
+> If you only want the fix, see `docs/FIX-eager-flush.md` §7 for exactly which
+> hunks are the fix vs fork-only tooling.
+
 ## The problem
 
 DeepSeek sometimes sends a tool call as visible markup instead of executing

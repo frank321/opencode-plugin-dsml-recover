@@ -59,8 +59,13 @@ The discriminator already existed in the buffer state — `hasBlockOpen` (a live
 `‹DSML›tool_calls` / `‹DSML›function_calls` opener is present) — but it was **not
 part of the guard**.
 
-## 4. The fix
+## 4. The fix (two co-requisite parts)
 
+The fix is **not** a single guard term. Making the guard hold the envelope is
+necessary but **not sufficient** — on its own it just defers the leak to the cap.
+Two changes are required together:
+
+### 4a. Hold past the eager window while a block opener is pending
 Add `!hasBlockOpen` to the eager-stop guard, in **both** paths:
 
 ```js
@@ -71,11 +76,24 @@ if (!final && !overCap && !insideValue && !hasBlockOpen && textBuffer.length > E
 ```
 
 **Rationale:** a pending block opener means this is a genuine envelope, not
-prose — hold it to the cap, where the existing redaction fires (or recovery, if
-its closer arrives). Prose with no block opener still eager-flushes, so the
-eager-stop keeps its original purpose (bounding the hold on opener-shaped prose).
+prose — hold it to the cap. Prose with no block opener still eager-flushes, so
+the eager-stop keeps its purpose (bounding the hold on opener-shaped prose).
 
-Files: `src/middleware.ts` (line ~302), `src/sse.ts` (line ~414).
+### 4b. Redact the unresolved runt at the cap (co-requisite)
+Once held, the envelope still has to be *disposed of* correctly. Upstream's
+over-cap / unresolved branches **re-emitted the raw markup verbatim** — so
+holding alone merely moved the leak to 64 KiB. The fix routes those branches
+through the plugin's own `stripRangesWithNote` + `redactionNote`: an
+unrecoverable runt is **redacted**, not echoed (the openclaw "delete, don't
+recover" lesson). Well-formed leaks still recover normally (recover-first,
+redact-the-runt).
+
+> **Verified:** with the guard **alone** (4a) and no redaction, the mangled
+> 8 KiB fixture is still emitted as visible markup — the regression test fails.
+> Both parts are required for the test to pass.
+
+Files: `src/middleware.ts` (guard ~line 302; redaction in the over-cap/unresolved
+branches), `src/sse.ts` (guard ~line 414; same redaction).
 
 ## 5. Why our test suite missed it (and the new regression tests)
 
@@ -110,17 +128,17 @@ described in §2, and it is the shape §4 now holds instead of flushing.
 
 ## 7. What in this repo is the *fix* vs fork-only tooling
 
-Offered upstream (the fix proper):
+The fix proper (guard 4a + redaction 4b):
 
-- `src/middleware.ts`, `src/sse.ts` — the `!hasBlockOpen` guard.
+- `src/middleware.ts`, `src/sse.ts` — the `!hasBlockOpen` guard **and** the
+  over-cap/unresolved redaction.
 - `test/stream.test.ts` — the two chunked regression tests.
 
 Fork-only (diagnostics/support; not required by the fix):
 
 - `capture` option + `src/debug-capture.ts` — NDJSON decision logging.
-- Instrumented `drain()` branch decisions.
-- **redact unresolved runts** on the emit paths (a defence-in-depth companion to
-  the guard; also worth upstreaming, but separable).
+- The instrumented `drain()` calls that record branch decisions (these are
+  interleaved with the fix hunks but are separable).
 - `docs/RUNBOOK-FORK.md`, `docs/FIX-eager-flush.md` (this file).
 
 ## 8. Credit
