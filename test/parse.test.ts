@@ -220,9 +220,8 @@ describe("parseDsml — variants", () => {
 })
 
 /**
- * §22 — the FIRST REAL FIELD LEAK (2026-10-17T07:02:22Z, DeepInfra
- * DeepSeek-V4.1-Flash, long interactive session; session
- * `ses_eb7dc79ecffe4ly5TYBYH1za1V`). See server-manager docs/DSML_FIX_DESIGN.md §22.
+ * §22 — the FIRST REAL FIELD LEAK (2026-10-17, DeepInfra
+ * DeepSeek-V4.1-Flash, long interactive session; session id withheld).
  *
  * The provider dropped the outer block OPENER and the `invoke` opener, but KEPT a
  * MANGLED, MARKER-BEARING block closer (`</BAR DSML BAR calls>`) plus an orphan
@@ -239,7 +238,7 @@ describe("§22 real leak — markerless orphan parameter (2026-10-17)", () => {
   // The persisted shape: markerless <parameter> + orphan </invoke> + mangled closer.
   const realLeak = text(
     `<parameter name="shell">`,
-    "cd /Users/frank/git_repo/hermes-stock-watch && .venv/bin/python -m pytest ",
+    "cd /path/to/my-project && .venv/bin/python -m pytest ",
     "tests/test_deploy_scripts.py::test_archive_excludes_secrets_and_state -q 2>&1 | tail -18",
     `</parameter>`,
     "\n</invoke>\n",
@@ -256,7 +255,7 @@ describe("§22 real leak — markerless orphan parameter (2026-10-17)", () => {
     expect(call.name).toBe("shell")
     expect(call.arguments).toEqual({
       command:
-        "cd /Users/frank/git_repo/hermes-stock-watch && .venv/bin/python -m pytest " +
+        "cd /path/to/my-project && .venv/bin/python -m pytest " +
         "tests/test_deploy_scripts.py::test_archive_excludes_secrets_and_state -q 2>&1 | tail -18",
     })
     // Both the parameter element and the orphan closer are stripped from the text.
@@ -285,7 +284,7 @@ describe("§22 real leak — markerless orphan parameter (2026-10-17)", () => {
     // a call with the wrong tool. A wrong call is worse than a redaction (§3.D).
     const argNameShape = text(
       `<parameter name="path" string="true">`,
-      "/Users/frank/git_repo/opencode-plugin-dsml-recover/src/parse.ts",
+      "/path/to/plugin/src/parse.ts",
       `</parameter>`,
       "\n</invoke>\n",
       closeTag("calls"),

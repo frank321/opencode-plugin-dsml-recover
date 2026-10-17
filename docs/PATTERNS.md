@@ -4,6 +4,11 @@ Single source of truth for what the parser **accepts**, what it **repairs**, wha
 **rejects**, and which test proves each row. Every regex in `src/grammar.ts` must trace
 to a row here. Add a row and a test before adding a pattern.
 
+> **Provenance:** this catalogue derives from
+> [`bendtherules/opencode-plugin-dsml-fix`](https://github.com/bendtherules/opencode-plugin-dsml-fix)
+> (MIT), extended here with the V27 bare-value rescue and the associated reject arms.
+> See [`README.md`](../README.md) → Credits & lineage.
+
 > Writing rule for this file: never paste a live DSML token. The model may emit it and
 > our own harness (or the provider's greedy extractor) will turn this document into a
 > phantom tool call. Represent tokens with the placeholder `‹DSML›` and show the
@@ -37,7 +42,7 @@ to a row here. Add a row and a test before adding a pattern.
 ## 2. Leak / degradation variants (the real-world enemies)
 
 These are the shapes observed in the wild, in the order a stream degrades. Source tags:
-`[DB]` = captured in the user's OpenCode session DB, `[vLLM]` = vLLM PR #54686,
+`[DB]` = captured in a real OpenCode session DB, `[vLLM]` = vLLM PR #54686,
 `[OpenClaw]` = openclaw doubled-bar issue, `[Pi]` = pi-dsml grammar, `[CS]` = Cherry Studio.
 
 | # | Variant | Shape | Handle by | Test |
@@ -68,6 +73,7 @@ These are the shapes observed in the wild, in the order a stream degrades. Sourc
 | V24 | JSON params | `string="false"` | `JSON.parse`, fall back to raw on failure | `v24-json-param` |
 | V25 | Raw JSON body (no params) | invoke body is a bare `{...}` | fallback JSON parse | `v25-raw-json-body` |
 | V26 | **Wrapped tool** (dominant real shape) | orphan `<parameter name="X">` (marker optional) containing ≥1 complete inner `<MARKER parameter>` | recover call X with inner args (V13 policy: runtime validates) | `v26-*` |
+| V27 | **Bare-value orphan** (first real field leak, 2026-10-17) | orphan `<parameter name="X">VALUE</parameter>` with **no inner params**, followed by an orphan invoke/block closer; the argument **key** is not in the bytes | recover call X when a key can be derived for it from the session's live tool schema (exactly one required string arg: `shell`→`command`, `read`→`filePath`, `websearch`→`query`); otherwise **decline → redact** | `v27-*`, `§22-*` |
 
 ## 3. Reject arms (never emit a call)
 
@@ -81,12 +87,13 @@ tool the model never asked for.
 | Text inside a code fence | docs/examples must not execute | `v20-code-fence` |
 | Complete call but empty name | unusable, and must not trap buffer | `v14-empty-name` |
 | Invoke with no parseable parameter and no JSON body | nothing to run | `reject-empty-args` |
+| V27 bare-value orphan with no derivable key | a wrong key is worse than a redaction; never guess a key | `§22-declines` |
 | Native tool calls already present on the message | strip text only, do not double-run | `reject-native-present` |
 | `looksLikeDsml` false (no `DSML`/`end-of-sentence`) | skip whole pipeline | `reject-not-dsml` |
 
 ## 4. Transition: removal in old transcripts vs. rejection in new streams
 
-The user wants the same engine to serve **two consumers**:
+The same engine serves **two consumers**:
 
 1. **Streaming (new turns, `ctx.aisdk.language`)** — convert a DSML block into a real
    `tool-call` part *before* OpenCode's lowering, and rewrite `finishReason` to

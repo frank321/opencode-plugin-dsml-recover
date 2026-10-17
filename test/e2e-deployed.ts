@@ -25,7 +25,7 @@ const realLeak =
 
 // The arg-name shape (the one that keeps stalling): name holds an ARG, not a tool.
 const argNameShape =
-  `<parameter name="path" string="true">` + "/Users/frank/x.ts" + `</parameter>\n</invoke>\n` + closer
+  `<parameter name="path" string="true">` + "/path/to/x.ts" + `</parameter>\n</invoke>\n` + closer
 
 type Part = { type: string; [k: string]: unknown }
 

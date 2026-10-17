@@ -1,9 +1,8 @@
 # RUNBOOK — running the fork and capturing a real DSML leak
 
 > **Fork of `opencode-plugin-dsml-fix`.** This repo adds (a) a diagnostic capture
-> layer and (b) a fix for the residual leak (§16 of
-> `server-manager/docs/DSML_FIX_DESIGN.md`). Read `docs/STATUS.md` first for
-> upstream design history; this file is only about **operating the fork**.
+> layer and (b) a fix for the residual long-context leak (see
+> `docs/FIX-eager-flush.md`). This file is only about **operating the fork**.
 >
 > ⚠️ **Never write a literal DSML token into a source or doc file.** The
 > client/provider may parse it as a phantom tool call. Build tags at runtime
@@ -23,7 +22,7 @@
 
 All four changes are **observer/passthrough-safe**: prose never carries DSML
 ranges, so normal text is byte-identical. Verified: `tsc --noEmit` clean,
-**114/114 tests pass** (including two chunked-delivery regression tests for the
+**136/136 tests pass** (including two chunked-delivery regression tests for the
 eager-flush fix, which fail on the pre-fix code).
 
 ---
@@ -34,7 +33,7 @@ The upstream project builds with **bun**; `dist/` is gitignored, so **you must
 build before OpenCode can load it**.
 
 ```sh
-cd /Users/frank/git_repo/opencode-plugin-dsml-recover
+cd /path/to/opencode-plugin-dsml-recover
 export PATH="$HOME/.bun/bin:$PATH"        # bun 1.4.x
 bun install                                # once (types + deps)
 npx --yes esbuild ./src/index.ts --bundle --format=esm --target=esnext \
@@ -57,7 +56,7 @@ npx --yes esbuild ./src/index.ts --bundle --format=esm --target=esnext \
 ```jsonc
 "plugins": [
   {
-    "package": "file:///Users/frank/git_repo/opencode-plugin-dsml-recover",
+    "package": "file:///path/to/opencode-plugin-dsml-recover",
     "options": {
       "providers": ["deepinfra"],
       "debug": false,
@@ -90,8 +89,8 @@ After starting a fresh session:
 ```sh
 # (a) the loader logs the entrypoint — must point at the FORK, not the npm cache
 grep -a "loading plugin" ~/.local/share/opencode/log/opencode.log | tail -3
-#   want: entrypoint=file:///Users/frank/git_repo/opencode-plugin-dsml-recover/...
-#   NOT:  entrypoint=file:///Users/frank/.cache/opencode/npm/opencode-plugin-dsml-fix@latest/...
+#   want: entrypoint=file:///path/to/opencode-plugin-dsml-recover/...
+#   NOT:  entrypoint=file:///Users/you/.cache/opencode/npm/opencode-plugin-dsml-fix@latest/...
 
 # (b) the capture file grows once the fork sees a turn with a DSML candidate
 mkdir -p /tmp/opencode
@@ -103,7 +102,7 @@ ls -la /tmp/opencode/dsml-capture.log
 > config change and keep the **npm-cache** entrypoint in its log lines long after
 > the JSONC was repointed; (2) the **CLI role does not emit a `loading plugin`
 > line at all** — so a fork loaded by an interactive `opencode` run leaves no such
-> line. In this session the journal showed only npm-cache entrypoints while the
+> line. Observed case: the journal showed only npm-cache entrypoints while the
 > fork was demonstrably active.
 >
 > **Ground truth is the fork's own log**, written unconditionally at `setup`:
@@ -185,11 +184,11 @@ When a leak is suspected:
    file — see the warning at the top). Replay through `parseDsml` and the
    middleware to confirm which shape escapes.
 
-This fixture is the input the design doc has been waiting for (§14.4/§15.3).
+This fixture is the input the leak investigation had been waiting for.
 
 > **Outcome of the 2026-10-13 capture (recorded here so the next session does not
-> repeat the search).** The capture log captured the repo's long-context session
-> (`ses_ed8b7b4a`, 754,739 input tokens) and **found no leaked envelope in the
+> repeat the search).** The capture log covered a long-context session
+> (754,739 input tokens) and **found no leaked envelope in the
 > OpenCode store**: scanning all 11,189 `part` rows for a strong DSML signature
 > (an `invoke`/`parameter` tag) returned **0**; the 14 weak hits were all `tool`
 > parts — grep/read outputs that legitimately quote markup (e.g. Phi's
