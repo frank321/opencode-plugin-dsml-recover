@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test"
 import { appliesToProvider, mergeBareValueKeys, resolveConfig, schemaBareValueKeys } from "../src/config.ts"
 import { alreadySent, attemptKey, decideResume, messageText, needsSystemNudge, nudgeCapKey, turnId, wakeText } from "../src/fallback.ts"
+import { stalledStepSession } from "../src/index.ts"
 import { block, invoke, param } from "./fixtures.ts"
 import { parseDsml, redactionNote, stripRangesWithNote } from "../src/parse.ts"
 import { containsLiveMarker, recoveryNudge } from "../src/prompt.ts"
@@ -212,7 +213,6 @@ describe("retry", () => {
   test("attempt key is namespaced per message", () => {
     expect(attemptKey("s1", "m1")).not.toBe(attemptKey("s1", "m2"))
   })
-
   test("alreadySent reads the flag", () => {
     expect(alreadySent(undefined)).toBe(false)
     expect(alreadySent(false)).toBe(false)
@@ -227,6 +227,44 @@ describe("retry", () => {
 
   test("messageText tolerates null text", () => {
     expect(messageText({ role: "assistant", content: [{ type: "text", text: null }] })).toBeUndefined()
+  })
+})
+
+describe("stalled-step detection (wake trigger)", () => {
+  // Real envelope shape, verified live 2026-10-17: session id at data.sessionID.
+  const ended = (finish: string) => ({
+    type: "session.step.ended",
+    durable: { aggregateID: "ses_x" },
+    data: { sessionID: "ses_x", assistantMessageID: "msg_1", finish },
+  })
+
+  test("step ended with finish=stop → stalled (session from data.sessionID)", () => {
+    expect(stalledStepSession(ended("stop"))).toEqual({ sessionID: "ses_x", legacyIdle: false })
+  })
+
+  test("step ended with a real tool call → healthy, no wake", () => {
+    expect(stalledStepSession(ended("tool-calls"))).toBeUndefined()
+  })
+
+  test("unknown event types are ignored", () => {
+    expect(stalledStepSession({ type: "session.text.ended", data: { sessionID: "ses_x" } })).toBeUndefined()
+    expect(stalledStepSession({ type: "shell.exited" })).toBeUndefined()
+    expect(stalledStepSession(null)).toBeUndefined()
+  })
+
+  test("legacy idle events still qualify (future runtime safety)", () => {
+    expect(stalledStepSession({ type: "session.idle", sessionID: "ses_y" })).toEqual({
+      sessionID: "ses_y",
+      legacyIdle: true,
+    })
+    expect(stalledStepSession({ type: "session.status", status: { type: "idle" }, sessionID: "ses_y" })).toEqual({
+      sessionID: "ses_y",
+      legacyIdle: true,
+    })
+  })
+
+  test("missing session id → no wake", () => {
+    expect(stalledStepSession({ type: "session.step.ended", data: { finish: "stop" } })).toBeUndefined()
   })
 })
 

@@ -104,7 +104,24 @@ only), and the markerless outer opener needing candidate-hold in the stream.
 
 ## 6. Current test state
 
-`bun test` → **131/131 pass** (6 files). `./node_modules/.bin/tsc --noEmit` → clean.
+`bun test` → **136/136 pass** (6 files). `./node_modules/.bin/tsc --noEmit` → clean.
+
+**Wake trigger fixed (2026-10-17):** the retry/wake safety net was **dead** on
+this runtime. It subscribed for `session.idle` / `session.status` idle events —
+but a live probe (debug on, one full turn) showed the V2 runtime **never emits
+those to plugins**. The only terminal event is `session.step.ended`, carrying:
+
+```json
+{ "type": "session.step.ended",
+  "data": { "sessionID": "ses_…", "assistantMessageID": "msg_…", "finish": "stop" } }
+```
+
+The session id is at **`data.sessionID`**, not `event.sessionID` (the old code
+read the wrong path, so even a matching event yielded `undefined`). Now the wake
+fires on `session.step.ended` with `finish === "stop"` (a step that ended with no
+tool call = the stall), gated on a redaction having been seen for that session
+(the marker is erased, so no other signal survives). Legacy idle shapes are still
+accepted for a future runtime. See `stalledStepSession()` in `src/index.ts`.
 
 **Schema-aware bare-value keys (2026-10-17, this session):** the V27 rescue
 originally keyed off a **static allowlist** (`bareValueKeys`: `shell`→`command`,

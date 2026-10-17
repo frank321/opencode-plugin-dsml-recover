@@ -111,6 +111,9 @@ fragment. This row therefore expects `calls: []`, `ranges: [the parameter markup
 | `parse-orphan-off` | orphan invoke + flags off | no call |
 | `prompt-no-marker` | recovery nudge | no live marker bytes, outer-layer rule stated |
 | `fallback-*` | decide/messageText/send-once | nudge policy + send-once |
+| `stalled-step-stop` | `session.step.ended`, `data.finish:"stop"` | stall → wake (session from `data.sessionID`) |
+| `stalled-step-toolcall` | `session.step.ended`, `data.finish:"tool-calls"` | healthy → no wake |
+| `stalled-step-legacy-idle` | `session.idle` / `session.status{idle}` | still qualifies (future runtime) |
 
 ## Wrapper: `wrapDsmlLanguageModel`
 

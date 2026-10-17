@@ -252,23 +252,32 @@ export default Plugin.define({
       }
     })
 
-    // --- Retry: one idle wake per stalled message -------------------------------
+    // --- Retry: one wake per stalled step ---------------------------------------
+    // The wake must fire when a turn ends WITHOUT a tool call after the live fix
+    // redacted leaked markup. The V2 runtime does NOT emit `session.idle` /
+    // `session.status` to plugins (verified 2026-10-17 against a live turn: the
+    // only terminal event is `session.step.ended`). That event carries the
+    // payload the wake needs:
+    //   { type: "session.step.ended", data: { sessionID, finish, assistantMessageID } }
+    // `finish === "stop"` means the step ended with no tool call — the stall.
+    // The session id lives at `data.sessionID` (NOT `event.sessionID`).
     if (!config.retryEnabled) return
     const controller = new AbortController()
     void (async () => {
       try {
         for await (const raw of ctx.event.subscribe({ signal: controller.signal })) {
-          const type = (raw as { type?: unknown }).type
-          const idle = type === "session.idle" || (type === "session.status" && (raw as { status?: unknown }).status === "idle")
-          // `session.status` carries `{ status: { type: "idle" } }` in V2.
-          const statusIdle =
-            type === "session.status" &&
-            typeof (raw as { status?: unknown }).status === "object" &&
-            (raw as { status?: { type?: unknown } }).status?.type === "idle"
-          if (!idle && !statusIdle) continue
-          const sessionID = (raw as { sessionID?: unknown }).sessionID
-          if (typeof sessionID !== "string") continue
-          await maybeWake(ctx, config, log, sessionID, redactedSessions).catch((error) => log("wake failed", error))
+          const stalled = stalledStepSession(raw)
+          if (!stalled) continue
+          const { sessionID, legacyIdle } = stalled
+          // Fast path: a stalled step only matters if the live fix redacted
+          // markup for this session (the marker is gone from the stored text, so
+          // no other signal survives). Avoids a context() read on every normal
+          // turn. A marker-bearing transcript is still caught by the context
+          // hook's nudge, so this does not lose coverage.
+          if (!redactedSessions.has(sessionID) && !legacyIdle) continue
+          await maybeWake(ctx, config, log, sessionID, redactedSessions).catch((error) =>
+            log("wake failed", error),
+          )
         }
       } catch {
         // Aborted on unload.
@@ -280,6 +289,34 @@ export default Plugin.define({
 
 type Ctx = Parameters<Parameters<typeof Plugin.define>[0]["setup"]>[0]
 type Config = ReturnType<typeof resolveConfig>
+
+/**
+ * Interpret a plugin event as a "stalled step" signal.
+ *
+ * The V2 runtime emits `session.step.ended` with `data.finish`; a `finish` of
+ * `"stop"` means the turn ended with no tool call (the stall condition). The
+ * session id is at `data.sessionID` — NOT `event.sessionID` (verified live
+ * 2026-10-17; `session.idle`/`session.status` are never delivered to plugins).
+ *
+ * Returns the session id when the event is a terminal stalled step, else
+ * `undefined`. Legacy idle events (if ever emitted) also qualify.
+ */
+export function stalledStepSession(raw: unknown): { sessionID: string; legacyIdle: boolean } | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined
+  const evt = raw as { type?: unknown; data?: Record<string, unknown>; sessionID?: unknown; status?: { type?: unknown } }
+  const type = evt.type
+  const legacyIdle = type === "session.idle" || (type === "session.status" && evt.status?.type === "idle")
+  if (type !== "session.step.ended" && !legacyIdle) return undefined
+  const sessionID =
+    typeof evt.data?.sessionID === "string"
+      ? evt.data.sessionID
+      : typeof evt.sessionID === "string"
+        ? evt.sessionID
+        : undefined
+  if (!sessionID) return undefined
+  if (!legacyIdle && evt.data?.finish !== undefined && evt.data.finish !== "stop") return undefined
+  return { sessionID, legacyIdle }
+}
 
 async function maybeWake(
   ctx: Ctx,
