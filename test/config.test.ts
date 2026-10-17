@@ -111,6 +111,25 @@ describe("retry", () => {
     expect(decision).toEqual({ send: false, reason: "already-sent" })
   })
 
+  test("§22: redaction erased the marker → nudge still fires", () => {
+    // The §22 real leak: the live fix REDACTED the markup it could not recover,
+    // so the stored text is the marker-free note below. `looksLikeDsml` is false,
+    // yet the turn genuinely stalled — the redaction signal must still wake it.
+    const redactedText =
+      "One failure — the archive test. Let me see what it caught.\n\n" +
+      "<parameter name=\"shell\">cd /x && pytest -q 2>&1 | tail -18" +
+      "[removed malformed markup]"
+    expect(decideResume(redactedText, false, false)).toEqual({ send: false, reason: "no-marker" })
+    const woken = decideResume(redactedText, false, true)
+    expect(woken.send).toBe(true)
+    expect(woken.text).toContain("outer")
+  })
+
+  test("§22: redaction signal is send-once per message", () => {
+    const redactedText = "…| tail -18[removed malformed markup]"
+    expect(decideResume(redactedText, true, true)).toEqual({ send: false, reason: "already-sent" })
+  })
+
   test("attempt key is namespaced per message", () => {
     expect(attemptKey("s1", "m1")).not.toBe(attemptKey("s1", "m2"))
   })
