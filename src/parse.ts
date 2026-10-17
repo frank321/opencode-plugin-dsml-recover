@@ -8,6 +8,8 @@
  */
 
 import {
+  bareValueParameterRe,
+  BLOCK_TAG,
   blockCloseRe,
   blockOpenRe,
   danglingMarkerRe,
@@ -15,6 +17,7 @@ import {
   invokeCloseRe,
   invokeOpenRe,
   looksLikeDsml,
+  MARKER,
   orphanInvokeRe,
   orphanParameterRe,
   parameterLooseRe,
@@ -53,6 +56,27 @@ export interface ParseOptions {
    * Default true.
    */
   readonly wrappedTool?: boolean
+  /**
+   * Recover a bare-value orphan parameter (V27, §22 real leak): orphan
+   * `<parameter name="X">VALUE</parameter>` with NO inner children, followed by
+   * an orphan invoke/block closer. Default true.
+   *
+   * Unlike V26, the argument KEY is not in the bytes, so recovery needs a
+   * schema-derived key from `resolveBareValueKey`. Without a resolver this
+   * rescue declines (falls through to redaction) — it never guesses.
+   */
+  readonly bareValueTool?: boolean
+  /**
+   * Resolve the single argument key for `toolName` when a bare-value orphan
+   * parameter (V27) is found. Return the key ONLY when the tool's schema has
+   * exactly one required string argument (e.g. `shell`→`"command"`). Return
+   * `undefined` to decline — a recovered call with a guessed wrong key is worse
+   * than a redaction, so an unresolvable key must NOT be invented (§3.D).
+   *
+   * The parser itself has no tool schema; the caller (middleware, which knows
+   * the session's tools) supplies this. Absent → V27 is disabled.
+   */
+  readonly resolveBareValueKey?: (toolName: string) => string | undefined
 }
 
 export function parseDsml(text: string, input?: ParseOptions): ParseResult {
@@ -63,6 +87,8 @@ export function parseDsml(text: string, input?: ParseOptions): ParseResult {
     looseParameters: input?.looseParameters ?? true,
     rawJsonBody: input?.rawJsonBody ?? true,
     wrappedTool: input?.wrappedTool ?? true,
+    bareValueTool: input?.bareValueTool ?? true,
+    resolveBareValueKey: input?.resolveBareValueKey ?? (() => undefined),
   }
   if (!looksLikeDsml(text)) return EMPTY
 
@@ -204,6 +230,11 @@ function findOrphans(text: string, options: Required<ParseOptions>): Orphan[] {
   // contains marker-tagged children. Recovers the dominant real-world shape.
   // Requires at least one STRICT-complete inner parameter: a half-written inner
   // value must not become a call (V16 philosophy).
+  //
+  // Ranges claimed here are collected separately so the V27 bare-value rescue can
+  // skip ONLY genuine V26 matches — not the orphan-parameter ranges pushed above
+  // (which cover the same element and would otherwise mask every V27 candidate).
+  const wrappedRanges: Range[] = []
   if (options.wrappedTool) {
     for (const w of matchAll(text, wrappedToolRe())) {
       const name = w.groups[0]?.trim()
@@ -213,6 +244,45 @@ function findOrphans(text: string, options: Required<ParseOptions>): Orphan[] {
       const args = parseParameters(body, options)
       if (Object.keys(args).length === 0) continue
       orphans.push({ start: w.start, end: w.end, calls: [{ name, arguments: args }] })
+      wrappedRanges.push({ start: w.start, end: w.end })
+    }
+  }
+
+  // Bare-value orphan parameter (V27, §22 real leak): `<parameter name="X">VALUE
+  // </parameter>` with NO inner children, closed by a real `</parameter>` AND
+  // followed by an orphan invoke/block closer. The grammar's closer requirement
+  // is the authenticity signal; recovery then needs a KEY for VALUE, which the
+  // bytes do not carry. The caller supplies one via `resolveBareValueKey`
+  // (schema-derived). If no key resolves, this DECLINES and emits no call — a
+  // wrong key is worse than a redaction (§3.D). Only bodies WITHOUT inner
+  // marker-tagged params reach here (V26 already claimed those).
+  if (options.bareValueTool) {
+    // Skip only genuine V26 (wrapped-tool) matches — not the orphan-parameter
+    // ranges, which cover the same element and would mask every V27 candidate.
+    const overlapsV26 = (start: number, end: number) =>
+      wrappedRanges.some((r) => start < r.end && end > r.start)
+    for (const b of matchAll(text, bareValueParameterRe())) {
+      if (overlapsV26(b.start, b.end)) continue
+      const name = b.groups[0]?.trim()
+      if (!name) continue
+      const body = b.groups[1] ?? ""
+      // V26 territory: a body with complete inner params is not a bare value.
+      if (matchAll(body, parameterRe()).length > 0) continue
+      // The closer regex already fired in the grammar; nothing to strip without a key.
+      const key = options.resolveBareValueKey(name)
+      if (!key) continue
+      const value = decodeValue(body.replace(/^\r?\n/, "").replace(/\r?\n$/, ""), undefined)
+      if (typeof value !== "string" || value.length === 0) continue
+      // Swallow an immediately-following orphan invoke/block closer so a bare
+      // closer (e.g. a lone invoke end, or a mangled calls end) does not survive
+      // as visible markup. Both real leaks ended with one. Only whitespace may
+      // sit between the parameter close and the closer.
+      const afterCloser = new RegExp(
+        `^[ \\t\\r\\n]*</(?:${MARKER})?(?:invoke|${BLOCK_TAG})[ \\t\\r\\n]*>`,
+        "iu",
+      ).exec(text.slice(b.end))
+      const end = afterCloser ? b.end + afterCloser[0].length : b.end
+      orphans.push({ start: b.start, end, calls: [{ name, arguments: { [key]: value } }] })
     }
   }
 

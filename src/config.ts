@@ -28,6 +28,29 @@ export interface DsmlPluginOptions {
     rawJsonBody?: boolean
     /** Orphan `<parameter name="X">` with complete inner params. Default true. */
     wrappedTool?: boolean
+    /**
+     * Recover a bare-value orphan parameter (V27, §22 real leak):
+     * `<parameter name="X">VALUE</parameter>` with no inner params, followed by
+     * an orphan invoke/block closer. Default true.
+     *
+     * The argument KEY is not in the bytes, so recovery needs a key derived from
+     * the session's live tool schema (any tool whose input has exactly one
+     * required string arg — `shell`→`command`, `read`→`filePath`). Absent a
+     * derivable key the tool is NOT recovered (it falls through to redaction).
+     * `bareValueKeys` is a static fallback for schemas the walker cannot read.
+     */
+    bareValueTool?: boolean
+    /**
+     * Static tool-name → argument-key fallback for the bare-value rescue (V27).
+     * The primary source is the live tool schema seen on the `context` hook;
+     * this map is merged UNDER it, so it only fills gaps (custom agents, tools
+     * whose schema the walker cannot parse). A wrong key is worse than a
+     * redaction (§3.D).
+     *
+     * Defaults to the known single-required-string OpenCode tools
+     * (`shell`→`command`, `websearch`→`query`).
+     */
+    bareValueKeys?: Record<string, string>
   }
   /** History sanitization: strip leaked spans from replayed assistant text. */
   history?: {
@@ -81,6 +104,8 @@ export interface ResolvedDsmlConfig {
   readonly looseParameters: boolean
   readonly rawJsonBody: boolean
   readonly wrappedTool: boolean
+  readonly bareValueTool: boolean
+  readonly bareValueKeys: Readonly<Record<string, string>>
   readonly bufferLimit: number
   readonly responseFixEnabled: boolean
   readonly sanitizeEnabled: boolean
@@ -93,6 +118,19 @@ export interface ResolvedDsmlConfig {
 
 const DEFAULT_PROVIDERS = ["opencode-go", "opencode"] as const
 
+/**
+ * OpenCode tools whose schema has exactly ONE required string argument, so a
+ * bare leaked value can be bound to a key without guessing. Verified against
+ * `packages/core/src/tool/plugin/*.ts` (2026-10-17): these are the only built-in
+ * tools where the key is unambiguous (`edit` needs 3 args, `write`/`subagent`
+ * need several, `read`/`glob`/`grep`/`skill` require none → all excluded).
+ * Extend via `parse.bareValueKeys` for custom agents; the map is additive.
+ */
+const DEFAULT_BARE_VALUE_KEYS: Readonly<Record<string, string>> = {
+  shell: "command",
+  websearch: "query",
+}
+
 export function resolveConfig(input: DsmlPluginOptions = {}): ResolvedDsmlConfig {
   const parse = input.parse ?? {}
   const history = input.history ?? {}
@@ -104,6 +142,8 @@ export function resolveConfig(input: DsmlPluginOptions = {}): ResolvedDsmlConfig
     looseParameters: parse.looseParameters ?? true,
     rawJsonBody: parse.rawJsonBody ?? true,
     wrappedTool: parse.wrappedTool ?? true,
+    bareValueTool: parse.bareValueTool ?? true,
+    bareValueKeys: { ...DEFAULT_BARE_VALUE_KEYS, ...(parse.bareValueKeys ?? {}) },
     bufferLimit: responseFix.bufferLimit ?? 64 * 1024,
     responseFixEnabled: responseFix.enabled ?? true,
     sanitizeEnabled: history.sanitize ?? true,
@@ -113,6 +153,57 @@ export function resolveConfig(input: DsmlPluginOptions = {}): ResolvedDsmlConfig
     debug: input.debug ?? false,
     capture: input.capture ?? false,
   }
+}
+
+/** Build the V27 key resolver from the resolved config. tools absent → decline. */
+export function bareValueKeyResolver(config: ResolvedDsmlConfig): (toolName: string) => string | undefined {
+  return (toolName: string) => config.bareValueKeys[toolName]
+}
+
+/** Minimal JSON-Schema shape needed to read a tool's input schema. */
+interface JsonSchemaLike {
+  readonly type?: unknown
+  readonly properties?: Record<string, JsonSchemaLike>
+  readonly required?: readonly unknown[]
+}
+
+/**
+ * Derive the tool-name → argument-key map from the session's live tool schemas
+ * (`SessionContext.tools`), replacing the static `bareValueKeys` allowlist.
+ *
+ * A tool qualifies ONLY when its input schema is a plain object with exactly one
+ * required property, and that property is a string. Then a bare leaked value has
+ * exactly one place to go, so binding it is not a guess: `shell`→`command`,
+ * `read`→`filePath`, `websearch`→`query`. Every other shape declines — a wrong
+ * key is worse than a redaction (§3.D). The static config map is merged in as a
+ * fallback so custom agents with unusual schemas can still be listed by hand;
+ * an explicit `null` in config would be a future exclusion (not yet supported).
+ */
+export function schemaBareValueKeys(
+  tools: Record<string, { readonly input?: JsonSchemaLike }> | undefined,
+): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (!tools) return out
+  for (const [toolName, tool] of Object.entries(tools)) {
+    const schema = tool?.input
+    if (!schema || schema.type !== "object") continue
+    const required = Array.isArray(schema.required) ? schema.required : []
+    if (required.length !== 1) continue
+    const key = required[0]
+    if (typeof key !== "string") continue
+    const prop = schema.properties?.[key]
+    if (!prop || prop.type !== "string") continue
+    out[toolName] = key
+  }
+  return out
+}
+
+/** Merge the live schema-derived keys over the static config fallback. */
+export function mergeBareValueKeys(
+  config: ResolvedDsmlConfig,
+  tools: Record<string, { readonly input?: JsonSchemaLike }> | undefined,
+): Record<string, string> {
+  return { ...config.bareValueKeys, ...schemaBareValueKeys(tools) }
 }
 
 /** Whether this model/provider pair is in scope. Matches provider ID exactly. */

@@ -1,8 +1,9 @@
 /** Config defaults, per-shape parse flags, prompt guards, and retry decisions. */
 
 import { describe, expect, test } from "bun:test"
-import { appliesToProvider, resolveConfig } from "../src/config.ts"
+import { appliesToProvider, mergeBareValueKeys, resolveConfig, schemaBareValueKeys } from "../src/config.ts"
 import { alreadySent, attemptKey, decideResume, messageText, needsSystemNudge, nudgeCapKey, turnId, wakeText } from "../src/fallback.ts"
+import { stalledStepSession } from "../src/index.ts"
 import { block, invoke, param } from "./fixtures.ts"
 import { parseDsml, redactionNote, stripRangesWithNote } from "../src/parse.ts"
 import { containsLiveMarker, recoveryNudge } from "../src/prompt.ts"
@@ -82,6 +83,85 @@ describe("parse flags", () => {
   })
 })
 
+describe("schema-aware bare-value keys (§22 V27)", () => {
+  // Real shapes from the live tool list (12 tools) captured 2026-10-17.
+  const tools = {
+    shell: {
+      input: {
+        type: "object",
+        properties: {
+          command: { type: "string" },
+          workdir: { type: "string" },
+          timeout: { type: "number" },
+          background: { type: "boolean" },
+        },
+        required: ["command"],
+      },
+    },
+    websearch: {
+      input: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+    },
+    read: {
+      input: { type: "object", properties: { filePath: { type: "string" } }, required: ["filePath"] },
+    },
+    edit: {
+      input: {
+        type: "object",
+        properties: { filePath: { type: "string" }, oldString: { type: "string" }, newString: { type: "string" } },
+        required: ["filePath", "oldString", "newString"],
+      },
+    },
+    grep: {
+      input: { type: "object", properties: { pattern: { type: "string" } } }, // no `required`
+    },
+    subagent: {
+      input: { type: "object", properties: { prompt: { type: "string" }, n: { type: "number" } }, required: ["prompt", "n"] },
+    },
+  }
+
+  test("single required string arg → keyed", () => {
+    const keys = schemaBareValueKeys(tools)
+    expect(keys.shell).toBe("command")
+    expect(keys.websearch).toBe("query")
+    expect(keys.read).toBe("filePath")
+  })
+
+  test("multi-required / no-required / non-string → declined", () => {
+    const keys = schemaBareValueKeys(tools)
+    expect(keys.edit).toBeUndefined()
+    expect(keys.grep).toBeUndefined()
+    expect(keys.subagent).toBeUndefined()
+  })
+
+  test("absent tools → empty map (decline everything)", () => {
+    expect(schemaBareValueKeys(undefined)).toEqual({})
+  })
+
+  test("non-object schema (e.g. bare string) → declined", () => {
+    const keys = schemaBareValueKeys({ weird: { input: { type: "string" } } })
+    expect(keys.weird).toBeUndefined()
+  })
+
+  test("merge: live schema keys override/supplement the static fallback", () => {
+    const config = resolveConfig() // static: shell→command, websearch→query
+    const merged = mergeBareValueKeys(config, tools)
+    expect(merged.shell).toBe("command")
+    expect(merged.read).toBe("filePath") // live-only addition
+    expect(merged.edit).toBeUndefined()
+  })
+
+  test("a leaked bare value recovers end-to-end with schema-derived keys", () => {
+    // §22 real-leak shape, but keyed from the LIVE schema rather than config.
+    const leaked =
+      `<parameter name="read">` + "/etc/hosts" + `</parameter>\n</invoke>\n</\uFF5CDSML\uFF5Ccalls>`
+    const keys = mergeBareValueKeys(resolveConfig(), tools)
+    const r = parseDsml(leaked, { resolveBareValueKey: (n) => keys[n] })
+    expect(r.calls).toHaveLength(1)
+    expect(r.calls[0]!.name).toBe("read")
+    expect(r.calls[0]!.arguments).toEqual({ filePath: "/etc/hosts" })
+  })
+})
+
 describe("prompt", () => {
   test("nudge contains no live marker and states the outer-layer rule", () => {
     expect(containsLiveMarker(recoveryNudge("edit"))).toBe(false)
@@ -111,10 +191,28 @@ describe("retry", () => {
     expect(decision).toEqual({ send: false, reason: "already-sent" })
   })
 
+  test("§22: redaction erased the marker → nudge still fires", () => {
+    // The §22 real leak: the live fix REDACTED the markup it could not recover,
+    // so the stored text is the marker-free note below. `looksLikeDsml` is false,
+    // yet the turn genuinely stalled — the redaction signal must still wake it.
+    const redactedText =
+      "One failure — the archive test. Let me see what it caught.\n\n" +
+      "<parameter name=\"shell\">cd /x && pytest -q 2>&1 | tail -18" +
+      "[removed malformed markup]"
+    expect(decideResume(redactedText, false, false)).toEqual({ send: false, reason: "no-marker" })
+    const woken = decideResume(redactedText, false, true)
+    expect(woken.send).toBe(true)
+    expect(woken.text).toContain("outer")
+  })
+
+  test("§22: redaction signal is send-once per message", () => {
+    const redactedText = "…| tail -18[removed malformed markup]"
+    expect(decideResume(redactedText, true, true)).toEqual({ send: false, reason: "already-sent" })
+  })
+
   test("attempt key is namespaced per message", () => {
     expect(attemptKey("s1", "m1")).not.toBe(attemptKey("s1", "m2"))
   })
-
   test("alreadySent reads the flag", () => {
     expect(alreadySent(undefined)).toBe(false)
     expect(alreadySent(false)).toBe(false)
@@ -129,6 +227,44 @@ describe("retry", () => {
 
   test("messageText tolerates null text", () => {
     expect(messageText({ role: "assistant", content: [{ type: "text", text: null }] })).toBeUndefined()
+  })
+})
+
+describe("stalled-step detection (wake trigger)", () => {
+  // Real envelope shape, verified live 2026-10-17: session id at data.sessionID.
+  const ended = (finish: string) => ({
+    type: "session.step.ended",
+    durable: { aggregateID: "ses_x" },
+    data: { sessionID: "ses_x", assistantMessageID: "msg_1", finish },
+  })
+
+  test("step ended with finish=stop → stalled (session from data.sessionID)", () => {
+    expect(stalledStepSession(ended("stop"))).toEqual({ sessionID: "ses_x", legacyIdle: false })
+  })
+
+  test("step ended with a real tool call → healthy, no wake", () => {
+    expect(stalledStepSession(ended("tool-calls"))).toBeUndefined()
+  })
+
+  test("unknown event types are ignored", () => {
+    expect(stalledStepSession({ type: "session.text.ended", data: { sessionID: "ses_x" } })).toBeUndefined()
+    expect(stalledStepSession({ type: "shell.exited" })).toBeUndefined()
+    expect(stalledStepSession(null)).toBeUndefined()
+  })
+
+  test("legacy idle events still qualify (future runtime safety)", () => {
+    expect(stalledStepSession({ type: "session.idle", sessionID: "ses_y" })).toEqual({
+      sessionID: "ses_y",
+      legacyIdle: true,
+    })
+    expect(stalledStepSession({ type: "session.status", status: { type: "idle" }, sessionID: "ses_y" })).toEqual({
+      sessionID: "ses_y",
+      legacyIdle: true,
+    })
+  })
+
+  test("missing session id → no wake", () => {
+    expect(stalledStepSession({ type: "session.step.ended", data: { finish: "stop" } })).toBeUndefined()
   })
 })
 

@@ -1,40 +1,31 @@
 # opencode-plugin-dsml-recover
 
-Recovers DeepSeek DSML tool calls that leak into assistant text. OpenCode V2 plugin.
+Recovers DeepSeek DSML tool calls that leak into assistant text. An OpenCode V2
+plugin — tested with **DeepSeek V4.1 via the DeepInfra provider**.
 
-> ## Fork notice
->
-> This is a **fork of [`bendtherules/opencode-plugin-dsml-fix`](https://github.com/bendtherules/opencode-plugin-dsml-fix)**
-> (v0.2.0, MIT) — by **frank321**. The original plugin's buffering / parse /
-> recover architecture is **bendtherules'** work and is used unchanged. All credit
-> for the design is theirs; see [`LICENSE`](./LICENSE) (dual copyright) and the
-> attribution in [`docs/FIX-eager-flush.md`](./docs/FIX-eager-flush.md) §8.
->
-> **What this fork adds** (all upstream-safe; prose stays byte-identical):
->
-> 1. **Fix — eager-flush leak of mangled envelopes at long context.** Two
->    co-requisite changes: (a) hold past the 1 KB eager window while a block
->    opener is pending, and (b) **redact** an unresolved runt at the cap instead
->    of emitting raw markup. Fixes the ~300k-token leak. → `docs/FIX-eager-flush.md`
-> 2. **Diagnostics capture** (off by default): NDJSON of every stream decision to
->    `/tmp/opencode/dsml-capture.log`, to catch a leak in the act.
->    → `docs/RUNBOOK-FORK.md`
->
-> If you only want the fix, see `docs/FIX-eager-flush.md` §7 for exactly which
-> hunks are the fix vs fork-only tooling.
+## Scope & tested configuration
+
+**OpenCode only**, and **tested with DeepSeek V4.1 via the DeepInfra provider** —
+that is the setup this was built and verified against. It may help on other
+providers or models, but they have not been tested: this is a personal fix shared
+in the hope it saves someone else the same frustration, not a supported matrix.
+
+> The `providers` option defaults to `["opencode-go","opencode"]` (inherited from
+> the upstream project). **If you are on DeepInfra, set `"providers": ["deepinfra"]`** —
+> see [Install](#install).
 
 ## The problem
 
-DeepSeek sometimes sends a tool call as visible markup instead of executing
-it. The agent stalls mid-task, and you end up looking at raw tags in the chat.
+DeepSeek sometimes sends a tool call as visible markup instead of executing it.
+The agent stalls mid-task, and you end up looking at raw tags in the chat.
 
 Three things make it worse than a single failed turn:
 
-- It hits late in long sessions, when the provider's parser degrades: the
-  outer block opener goes missing, invoke openers get mangled, only inner
+- It hits late in long sessions, when the provider's parser degrades: the outer
+  block opener goes missing, invoke openers get mangled, and only inner
   parameter tags survive.
 - The broken parser stays silent. It passes the wreckage through as ordinary
-  text instead of raising, so nothing errors. Looks like the model just
+  text instead of raising, so nothing errors. It looks like the model just
   declined to call the function.
 - The leak lands in the transcript, and from there the model copies its own
   broken format. Every turn after fails the same way until you intervene.
@@ -42,64 +33,65 @@ Three things make it worse than a single failed turn:
 This plugin repairs those leaks inside OpenCode. Good responses pass through
 untouched.
 
-## What I learned
+## What it does
 
-Read this before touching any setting. Two sources: my own long sessions on
-`opencode-go/deepseek-*`, and the upstream vLLM reports.
+1. **Parse leaked tool calls.** A tolerant parser for complete blocks plus every
+   degraded shape in the [catalogue](./docs/PATTERNS.md): orphan invokes,
+   mis-closed parameters, bare-JSON bodies, wrapped tools, bare-value orphans
+   (the argument key derived from the session's live tool schema), marker noise,
+   and chunk-split tags. [Settings](#parse)
+2. **Sanitize history.** Strips old leaks from replayed assistant text, leaving a
+   short inline note where each one was. History never becomes calls, so nothing
+   executes twice. [Settings](#history)
+3. **Fix live tool calls.** Leaked markup in a live response becomes a real call,
+   so the agent loop dispatches it instead of stalling. [Settings](#responsefix)
+4. **Retry stalled turns.** Sometimes a reply is too broken to repair — the
+   markup cannot become a call no matter how tolerant the parser is. Instead of
+   leaving the session stuck, the plugin tells the model its last reply had
+   broken tool markup and asks it to re-issue the call. If the session then sits
+   idle, it sends one minimal wake-up. Each broken reply gets one correction and
+   at most one wake; a reply that stays silent after its poke is left alone. A
+   new reply always starts fresh, so retrying never stops a live chat.
+   [Settings](#retry)
+
+## What we learned
+
+Read this before touching any setting. Two sources: the upstream author's long
+sessions on `opencode-go/deepseek-*`, and the upstream vLLM reports. (This
+project's own testing was DeepSeek V4.1 on DeepInfra — see Scope above.)
 
 1. **History is the real battlefield.** Fresh leaks are rare — the vLLM team
    served billions of production tokens, sampled 9,500 responses, and found
-   76 leaks ([0.80%](https://github.com/vllm-project/vllm/pull/54686)). But
-   one leak in the transcript poisons every turn after it, because the model
-   imitates its own degraded output. vLLM
-   [#40801](https://github.com/vllm-project/vllm/issues/40801) reports the
-   same contamination. So live recovery fires rarely by design, and **history
-   sanitization matters more than everything else combined**. If you change
-   one flag, make it `history.sanitize`. Leave it on.
-2. **It only strikes at long context.** Every leak I saw came thousands of
-   messages into a session, never early. Short sessions need nothing. The
-   plugin sits idle and costs nothing.
-3. **The backend is inconsistent.** My working theory: `opencode-go` fans out
-   across multiple backend providers and only some mangle DSML. Identical
-   prompts fail or succeed at random. I stopped waiting for a provider fix —
-   there may be no single provider to fix.
+   76 leaks ([0.80%](https://github.com/vllm-project/vllm/pull/54686)). But one
+   leak in the transcript poisons every turn after it, because the model imitates
+   its own degraded output. vLLM
+   [#40801](https://github.com/vllm-project/vllm/issues/40801) reports the same
+   contamination. So live recovery fires rarely by design, and **history
+   sanitization matters more than everything else combined**. If you change one
+   flag, make it `history.sanitize`. Leave it on.
+2. **It only strikes at long context.** Every leak seen came thousands of
+   messages into a session, never early. Short sessions need nothing. The plugin
+   sits idle and costs nothing.
+3. **The backend is inconsistent.** A working theory: `opencode-go` fans out
+   across multiple backend providers and only some mangle DSML. Identical prompts
+   fail or succeed at random. Waiting for a provider fix is not a plan — there
+   may be no single provider to fix.
 
 ## Install
 
 ```sh
-# from npm (upstream name; our fork is not published yet)
+# from npm (upstream name; this fork is not published yet)
 opencode plugin add opencode-plugin-dsml-fix
 
-# local fork (what we run): point the config at the checkout
-#   "package": "file:///Users/frank/git_repo/opencode-plugin-dsml-recover"
+# local checkout (what we run): point the config at the directory
+#   "package": "file:///path/to/opencode-plugin-dsml-recover"
 ```
 
-- Requires OpenCode V2 (`2.0.x`).
-- Defaults have everything enabled: `parse`, `history`, `responseFix`,
-  `retry`. The only off-by-default flag is `debug`.
-
-## What it does
-
-1. **Parse leaked tool calls.** Tolerant parser for complete blocks plus
-   every degraded shape I catalogued: orphan invokes, mis-closed parameters,
-   bare-JSON bodies, wrapped tools, marker noise, chunk-split tags.
-   [Settings](#parse)
-2. **Sanitize history.** Strips old leaks from replayed assistant text, with
-   a short inline note where each one was. History never becomes calls, so
-   nothing executes twice. [Settings](#history)
-3. **Fix live tool calls.** Leaked markup in a live response becomes a real
-   call, so the agent loop dispatches it instead of stalling.
-   [Settings](#responsefix)
-4. **Retry stalled turns.** Sometimes a reply is too broken to repair —
-   the markup can't become a call no matter how tolerant the parser is.
-   Instead of leaving the session stuck, the plugin tells the model its last
-   reply had broken tool markup and asks it to re-issue the call properly.
-   If the session then sits idle, it sends one minimal wake-up to get things
-   moving again. Each broken reply gets one correction and at most one wake.
-   A reply that stays silent after its poke is left alone — if the first poke
-   got no reply, the cause is outside anything a second poke can fix. A new
-   reply always starts fresh, so retrying never stops a live chat.
-   [Settings](#retry)
+- **OpenCode V2** (`2.0.x`).
+- **Tested:** DeepSeek V4.1 via DeepInfra. Set `providers` to match your setup —
+  e.g. `"providers": ["deepinfra"]`.
+- Defaults have everything enabled: `parse`, `history`, `responseFix`, `retry`.
+  The only off-by-default flag is `debug`.
 
 ## Configuration
 
@@ -109,10 +101,12 @@ Object form in `opencode.jsonc`:
 {
   "plugins": [
     {
-      "package": "file:///Users/frank/git_repo/opencode-plugin-dsml-recover",
+      "package": "file:///path/to/opencode-plugin-dsml-recover",
       "options": {
+        // match your provider — DeepInfra is the tested one
+        "providers": ["deepinfra"],
         "parse": { "wrappedTool": false },
-        "retry": { "maxAttempts": 5 },
+        "retry": { "channel": "user" },
       },
     },
   ],
@@ -121,8 +115,8 @@ Object form in `opencode.jsonc`:
 
 ### `parse`
 
-Default: all on. Controls parser tolerance, for live recovery and for
-deciding what counts as a stain in history (same engine, both directions).
+Default: all on. Controls parser tolerance, for live recovery and for deciding
+what counts as a stain in history (same engine, both directions).
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -130,14 +124,16 @@ deciding what counts as a stain in history (same engine, both directions).
 | `looseParameters` | `true` | Re-scan past broken closers. |
 | `rawJsonBody` | `true` | Bare-JSON invoke bodies. |
 | `wrappedTool` | `true` | Orphan named parameter with complete inner params. |
+| `bareValueTool` | `true` | Bare-value orphan parameter (no inner params). The argument key is not in the bytes, so it is derived from the session's live tool schema — a tool qualifies only when its input has exactly one required string arg (`shell`→`command`, `read`→`filePath`, `websearch`→`query`). Absent a derivable key the tool is redacted, never guessed. |
+| `bareValueKeys` | `{shell:"command", websearch:"query"}` | Static tool→key fallback, merged *under* the live schema. Only fills gaps (custom agents, unreadable schemas). A wrong key is worse than a redaction. |
 
-When to disable one: that shape misfires (recovers something that was never
-a call). Example: `"parse": { "wrappedTool": false }`. No master switch on
-purpose. Flip individual flags.
+When to disable one: that shape misfires (recovers something that was never a
+call). Example: `"parse": { "wrappedTool": false }`. There is no master switch on
+purpose — flip individual flags.
 
 ### `history`
 
-Default: on (`sanitize: true`). Highest impact layer (see above).
+Default: on (`sanitize: true`). Highest-impact layer (see above).
 
 When to disable: don't. Switching it off re-poisons the transcript and the
 imitation loop comes back. If the redaction notes bother you, file an issue
@@ -150,16 +146,15 @@ Default: on (`enabled: true`). One switch for the whole layer.
 | Option | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | Turn leaked markup into real tool calls. |
-| `bufferLimit` | `65536` | Cap on held text while deciding. Safety bound, not a target. |
+| `bufferLimit` | `65536` | Cap on held text while deciding. A safety bound, not a target. |
 
 When to disable: recovery ever corrupts a good turn
 (`"responseFix": { "enabled": false }`).
 
-On buffering, since people ask: normal text is never held. The fix holds
-only a span that already opened as a real candidate (released if no call
-structure develops), or a trailing fragment that already looks like a broken
-tag (capped, released if it never becomes one). Everything else streams
-through untouched.
+On buffering, since people ask: normal text is never held. The fix holds only a
+span that already opened as a real candidate (released if no call structure
+develops), or a trailing fragment that already looks like a broken tag (capped,
+released if it never becomes one). Everything else streams through untouched.
 
 ### `retry`
 
@@ -171,27 +166,27 @@ Default: on. Wakes stalled turns, carries the conditional correction.
 | `channel` | `"system"` | `"system"` = minimal ping, correction rides in system. `"user"` = full correction as a synthetic user turn. |
 | `nudge` | `true` | Correction when history ends unrecovered. One per message. |
 
-Send-once per message: a reply that stays silent after its poke is left
-alone. New replies always start fresh, so the cap never stops a live chat —
-it only stops re-poking a message that never changes, where each poke would
-burn a model call for nothing.
+Send-once per message: a reply that stays silent after its poke is left alone.
+New replies always start fresh, so the cap never stops a live chat — it only
+stops re-poking a message that never changes, where each poke would burn a model
+call for nothing.
 
-When to disable: wakes interrupt you (`"retry": { "enabled": false }`), or
-keep the wake but drop the correction text (`"retry": { "nudge": false }`).
+When to disable: wakes interrupt you (`"retry": { "enabled": false }`), or keep
+the wake but drop the correction text (`"retry": { "nudge": false }`).
 
 ### General
 
 | Option | Default | Meaning |
 |---|---|---|
-| `providers` | `["opencode-go","opencode"]` | Provider IDs in scope. Empty disables the plugin. |
+| `providers` | `["opencode-go","opencode"]` | Provider IDs in scope. Empty disables the plugin. **Default is inherited from upstream; the tested setup uses `["deepinfra"]`.** |
 | `debug` | `false` | Per-turn logging (see Verify). Only off-by-default flag. |
 
-Full shape catalogue: `docs/PATTERNS.md`.
+Full shape catalogue: [`docs/PATTERNS.md`](./docs/PATTERNS.md).
 
 ## Verify
 
-Set `"debug": true`. Each turn logs one request line plus one line per
-response attempt (`sessionID/user-messageID`, `#n` counts retries):
+Set `"debug": true`. Each turn logs one request line plus one line per response
+attempt (`sessionID/user-messageID`, `#n` counts retries):
 
 ```
 [dsml] request ses_abc/msg_xyz sanitized=2msgs/3parts nudge=no
@@ -205,44 +200,79 @@ response attempt (`sessionID/user-messageID`, `#n` counts retries):
 - `held-candidate-no-call`: markup-shaped but unparseable, emitted verbatim.
   Seeing this often means a new variant. File an issue with the excerpt.
 
-## Research
-
-Same bug class, convergent fixes. This is the OpenCode-native one:
-
-- [vLLM #54686](https://github.com/vllm-project/vllm/pull/54686): leak
-  taxonomy with production shares (mis-closed param 49%, runaway invoke
-  name 32%, unrecognized opener 21%). My catalogue mirrors it.
-- [vLLM #48931](https://github.com/vllm-project/vllm/issues/48931): START
-  token omitted at long context (~95k+ tokens); same orphan-invoke fallback
-  I ship. Fixed upstream by
-  [#55954](https://github.com/vllm-project/vllm/pull/55954).
-- [vLLM #40801](https://github.com/vllm-project/vllm/issues/40801):
-  streaming leaks plus the history-contamination effect behind my
-  sanitize-first stance.
-- [CherryStudio #14747](https://github.com/CherryHQ/cherry-studio/pull/14747):
-  streaming DSML state machine and generate wrapper. I ported the algorithm
-  into the middleware.
-- [openclaw](https://github.com/openclaw/openclaw) DSML transport and
-  grammar: doubled-bar markers, buffer cap, chunk boundaries. Same
-  conclusions.
-- [pi-mono `pi-dsml`](https://github.com/badlogic/pi-mono) grammar: mangled
-  closers, ranges model, code-fence guard, `string=false` JSON rule. Shapes
-  ported into my parser.
-
 ## Development
 
 ```bash
 bun install
-bun test        # 115 tests: grammar, parser, stream, wrapper, config, sse, golden
+bun test        # 136 tests: grammar, parser, stream, wrapper, config, sse, golden
 bun run check   # typecheck + tests
 bun run build   # compiled dist/ for npm (prepublish runs check + build)
 ```
 
-- `docs/PATTERNS.md`: failure-shape catalogue, source of truth for recovery
-- `docs/TEST-MATRIX.md`: behaviour to test map
-- `test/golden/`: synthetic fixtures and generator (`build-fixtures.ts`).
-  No live markup bytes anywhere in the repo.
+- [`docs/PATTERNS.md`](./docs/PATTERNS.md): failure-shape catalogue, source of
+  truth for recovery
+- [`docs/TEST-MATRIX.md`](./docs/TEST-MATRIX.md): behaviour-to-test map
+- [`docs/FIX-eager-flush.md`](./docs/FIX-eager-flush.md): the long-context
+  eager-flush fix
+- [`docs/RUNBOOK-FORK.md`](./docs/RUNBOOK-FORK.md): operating the fork and
+  capturing a real leak
+- `test/golden/`: synthetic fixtures and generator (`build-fixtures.ts`). No live
+  markup bytes anywhere in the repo.
+
+## How this was built
+
+The leak diagnosis and this project's code were developed with **DeepSeek V4.1**
+— the same model the fix targets. Using it to analyze the problem it was causing
+is what unlocked the fix.
+
+## Credits & lineage
+
+This is a fork of
+[`bendtherules/opencode-plugin-dsml-fix`](https://github.com/bendtherules/opencode-plugin-dsml-fix)
+(v0.2.0, MIT). The buffering / parse / recover architecture is **bendtherules'**
+work and is used unchanged — all credit for the design is theirs.
+
+What this fork adds:
+
+1. **Fix — eager-flush leak of mangled envelopes at long context.** Hold past the
+   1 KB eager window while a block opener is pending, and redact an unresolved
+   runt at the cap instead of emitting raw markup. Fixes the ~300k-token leak.
+   → [`docs/FIX-eager-flush.md`](./docs/FIX-eager-flush.md)
+2. **Schema-aware bare-value rescue (V27).** Recovers the markerless bare-value
+   leak shape (an orphan `parameter` whose argument key was stripped) by deriving
+   the key from the session's live tool schema. → [`docs/PATTERNS.md`](./docs/PATTERNS.md)
+3. **Wake on `session.step.ended`.** The retry safety net was dead: the V2
+   runtime never emits the `session.idle` events the upstream code awaited.
+4. **Diagnostics capture** (off by default): NDJSON of every stream decision, to
+   catch a leak in the act. → [`docs/RUNBOOK-FORK.md`](./docs/RUNBOOK-FORK.md)
+
+If you only want the fix, see
+[`docs/FIX-eager-flush.md`](./docs/FIX-eager-flush.md) §7 for exactly which hunks
+are the fix versus fork-only tooling.
+
+## Research
+
+Same bug class, convergent fixes. This is the OpenCode-native one:
+
+- [vLLM #54686](https://github.com/vllm-project/vllm/pull/54686): leak taxonomy
+  with production shares (mis-closed param 49%, runaway invoke name 32%,
+  unrecognized opener 21%). The catalogue here mirrors it.
+- [vLLM #48931](https://github.com/vllm-project/vllm/issues/48931): START token
+  omitted at long context (~95k+ tokens); same orphan-invoke fallback this plugin
+  ships. Fixed upstream by
+  [#55954](https://github.com/vllm-project/vllm/pull/55954).
+- [vLLM #40801](https://github.com/vllm-project/vllm/issues/40801): streaming
+  leaks plus the history-contamination effect behind the sanitize-first stance.
+- [CherryStudio #14747](https://github.com/CherryHQ/cherry-studio/pull/14747):
+  streaming DSML state machine and generate wrapper. The algorithm is ported into
+  the middleware.
+- [openclaw](https://github.com/openclaw/openclaw) DSML transport and grammar:
+  doubled-bar markers, buffer cap, chunk boundaries. Same conclusions.
+- [pi-mono `pi-dsml`](https://github.com/badlogic/pi-mono) grammar: mangled
+  closers, ranges model, code-fence guard, `string=false` JSON rule. Shapes
+  ported into this parser.
 
 ## License
 
-MIT. See [LICENSE](./LICENSE).
+MIT. See [LICENSE](./LICENSE) — dual copyright (bendtherules, original project;
+frank321, fork enhancements).

@@ -107,10 +107,15 @@ export function needsSystemNudge(
  * @param text the latest assistant text
  * @param alreadySent whether a nudge/wake was already sent for this message
  */
-export function decideResume(text: string, alreadySent: boolean): FallbackDecision {
-  if (!looksLikeDsml(text)) return { send: false, reason: "no-marker" }
-  const { calls } = parseDsml(text)
-  if (calls.length > 0) return { send: false, reason: "already-recoverable" }
+export function decideResume(text: string, alreadySent: boolean, redactionSeen = false): FallbackDecision {
+  // `redactionSeen`: this session's live fix REDACTED markup it could not
+  // recover. The redaction erased the DSML marker from the stored text, so
+  // `looksLikeDsml` is false and the normal trigger would never fire — but the
+  // turn genuinely stalled, so the wake is still warranted (§22).
+  if (!redactionSeen && !looksLikeDsml(text)) return { send: false, reason: "no-marker" }
+  if (looksLikeDsml(text) && parseDsml(text).calls.length > 0) {
+    return { send: false, reason: "already-recoverable" }
+  }
   if (alreadySent) return { send: false, reason: "already-sent" }
   return { send: true, text: recoveryNudge() }
 }

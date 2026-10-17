@@ -109,7 +109,7 @@ code**, pass after):
 - `stream-eager-open: block opener + dropped parameter opener is held, not flushed raw`
 
 On the pre-fix code these leak ~71,698 raw characters; after the fix they are
-redacted. Full suite: **114/114 pass**, `tsc --noEmit` clean.
+redacted. Full suite: **136/136 pass**, `tsc --noEmit` clean.
 
 | Shape | Before | After |
 | :--- | :--- | :--- |

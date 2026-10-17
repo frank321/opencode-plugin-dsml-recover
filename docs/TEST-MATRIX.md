@@ -4,9 +4,19 @@ One row per parser behaviour. Each row names a fixture (inline string or file un
 `test/fixtures/`) and the assertion. Tests are numbered `V#`/`reject-*` to match
 `docs/PATTERNS.md`.
 
+> **Provenance:** this matrix derives from
+> [`bendtherules/opencode-plugin-dsml-fix`](https://github.com/bendtherules/opencode-plugin-dsml-fix)
+> (MIT), extended here with the V27 / `schema-keys-*` and `stalled-step-*` rows.
+> See [`README.md`](../README.md) → Credits & lineage.
+
 Fixture convention: a **fixture is raw text built at runtime** so we can inject the real
 `U+FF5C` bytes without this repository ever containing them literally; helpers in
 `test/fixtures.ts` provide `m` (marker), `invoke`, `param`, `block`.
+
+> Some IDs (`§21-*`, `§22-*`) are named after the milestone leaks they lock: **§22**
+> is the first real field leak (markerless orphan parameter, 2026-10-17) and
+> **§21** is the earlier regression guard against the parser eating quoted prose.
+> The labels are historical; the fixtures are the source of truth.
 
 ## Parser: `parseDsml(text)`
 
@@ -21,7 +31,7 @@ Fixture convention: a **fixture is raw text built at runtime** so we can inject 
 | `v7-tool-call-singular` | block tag `tool_call` | 1 call |
 | `v8-function-calls` | block tag `function_calls` | 1 call |
 | `v9-orphan-invoke` | `invoke("edit",[param("path","a.kt")])` with **no** block | 1 call, range covers invoke |
-| `v10-orphan-parameter` | `param("content","x")` only (no invoke) | 1 call named `unknown`? **NO** — see note |
+| `v10-orphan-parameter` | `param("content","x")` only (no invoke) | 0 calls; markup stripped. See note |
 | `v11-misspelled-closer` | `param("alpha",..)‹BAR›>‹BAR›parameter name="beta"..` | 2 calls: alpha + beta (not swallowed) |
 | `v12-runaway-name` | `invoke("record_item {\\ncategory")` | 0 calls, range strips it |
 | `v13-undeclared-tool` | `invoke("totally_made_up",[param("x","y")])` | 1 call kept |
@@ -37,6 +47,16 @@ Fixture convention: a **fixture is raw text built at runtime** so we can inject 
 | `v24-json-param` | `param` `string="false"` value `{"a":1}` | args[{a:1}] as object |
 | `v25-raw-json-body` | invoke body `{"a":1}` no params | args `{a:1}` |
 | `v26-wrapped-tool` etc. | markerless/markered outer + complete inners | call X recovered; plain prose / incomplete nesting untouched |
+| `v27-bare-value-rescue` | bare-value orphan `parameter` + orphan closer + resolver key | 1 call (tool name in `name`); closer-swallow strips the trailing closer |
+| `§22-fixed` | real leak (2026-10-17), resolver maps `shell`→`command` | 1 call, `</invoke>` + mangled ` calls>` stripped (text → `""`) |
+| `§22-declines` | same leak, no resolver / unknown tool | 0 calls (never guess a key) |
+| `§22-shape-B` | orphan `parameter name="path"`/`"newString"` (arg name, not tool) | 0 calls — resolver only keys real tool names |
+| `§22-held-prefix` | leak minus its closer | 0 calls, 0 ranges (no authenticity signal) |
+| `§21-regression` | prose merely mentioning `<parameter name="…">` | 0 calls, 0 ranges (fix must not reopen the fork's text-eating bug) |
+| `schema-keys-single-arg` | tool schema: one required string arg | keyed (`shell`→`command`, `read`→`filePath`, `websearch`→`query`) |
+| `schema-keys-multi-none-nonstring` | 3-required / no-`required` / non-string prop | declined (no key) |
+| `schema-keys-absent-tools` | no tool list | empty map → decline everything |
+| `schema-keys-merge` | live schema over static `bareValueKeys` | live key wins; live-only tools added |
 | `reject-no-marker` | `"hello world"` | 0 calls, 0 ranges |
 | `reject-not-dsml` | long prose, no marker | fast path (looksLikeDsml false) |
 | `reject-empty-args` | `invoke("bash",[])` | 0 calls (nothing to run) |
@@ -64,6 +84,18 @@ fragment. This row therefore expects `calls: []`, `ranges: [the parameter markup
 | `stream-eager-stop` | prose opener, no structure | flushed early as text, nothing held |
 | `stream-transition` | reasoning part mid-text | held text flushed first, order preserved |
 
+## Settled stats (`onSettled`)
+
+| ID | Fixture | Expect |
+|----|---------|--------|
+| `settled-recovery-counts` | SSE block with 1 recovered call | `{ calls: 1, sawCandidate: true }`, reported once |
+| `settled-passthrough` | plain SSE text, middleware plain prose | `{ calls: 0, sawCandidate: false, redacted: false }` |
+
+> `redacted` is set when a turn redacted leaked markup it could not recover. The
+> retry safety net reads it because redaction erases the DSML marker from stored
+> text, so `looksLikeDsml(transcript)` is false afterwards — without this flag the
+> wake would never fire for the §22 case.
+
 ## Repair: `recoverStoredMessage(message)`
 
 | ID | Fixture | Expect |
@@ -83,13 +115,16 @@ fragment. This row therefore expects `calls: []`, `ranges: [the parameter markup
 
 | ID | Fixture | Expect |
 |----|---------|--------|
-| `config-defaults` | `resolveConfig()` | both Zen providers, all flags on, debug off |
+| `config-defaults` | `resolveConfig()` | default Zen providers, all flags on, debug off |
 | `config-granular` | one parse flag off | others stay on |
 | `config-layers` | each layer off | that layer disabled |
 | `parse-flags-off` | complete block + all flags off | parses |
 | `parse-orphan-off` | orphan invoke + flags off | no call |
 | `prompt-no-marker` | recovery nudge | no live marker bytes, outer-layer rule stated |
 | `fallback-*` | decide/messageText/send-once | nudge policy + send-once |
+| `stalled-step-stop` | `session.step.ended`, `data.finish:"stop"` | stall → wake (session from `data.sessionID`) |
+| `stalled-step-toolcall` | `session.step.ended`, `data.finish:"tool-calls"` | healthy → no wake |
+| `stalled-step-legacy-idle` | `session.idle` / `session.status{idle}` | still qualifies (future runtime) |
 
 ## Wrapper: `wrapDsmlLanguageModel`
 

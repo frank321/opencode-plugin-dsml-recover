@@ -35,8 +35,14 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/bendtherules/opencode-plugin-dsml-fix.git"
+    "url": "git+https://github.com/frank321/opencode-plugin-dsml-recover.git"
   },
-  "homepage": "https://github.com/bendtherules/opencode-plugin-dsml-fix",
-  "author": "bendtherules"
+  "homepage": "https://github.com/frank321/opencode-plugin-dsml-recover",
+  "bugs": {
+    "url": "https://github.com/frank321/opencode-plugin-dsml-recover/issues"
+  },
+  "author": "frank321",
+  "contributors": [
+    "bendtherules (original project: opencode-plugin-dsml-fix)"
+  ]
 }
