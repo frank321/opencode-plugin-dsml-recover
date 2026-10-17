@@ -89,7 +89,8 @@ test/wrapper.test.ts  generate + wrapper delegation — ALL PASS
 test/config.test.ts   config matrix, strict parsing, prompt guards, fallback, system nudge — ALL PASS
 ```
 
-Total: **89 tests, 0 fail**. `tsc --noEmit` clean.
+Total: **89 tests, 0 fail** at the time of writing (**123 tests, 0 fail** now — see §6).
+`tsc --noEmit` clean.
 
 Golden verification against real captured failures (9 wrapped edit/shell leaks
 from a long-context DeepSeek session, preserved as synthetic byte-faithful
@@ -103,7 +104,21 @@ only), and the markerless outer opener needing candidate-hold in the stream.
 
 ## 6. Current test state
 
-`bun test` → **114/114 pass** (6 files). `./node_modules/.bin/tsc --noEmit` → clean.
+`bun test` → **123/123 pass** (6 files). `./node_modules/.bin/tsc --noEmit` → clean.
+
+**§22 / V27 session (2026-10-17):** completed the parked WIP (`7a3583c`). The
+orphan-closer-swallow edit was finished — it referenced `MARKER`/`BLOCK_TAG`
+without importing them from `src/grammar.ts`, which threw `MARKER is not defined`
+on every turn (this is what stalled the session; it was a plain missing import,
+**not** a DSML/provider fault). After the import fix:
+
+1. the `§22-fixed` test goes green — the bare-value rescue now also swallows the
+   trailing orphan invoke/block closer, so `</invoke>` no longer leaks as markup;
+2. two `sse.test.ts` "settled stats" assertions updated for the `redacted` field
+   (added by `45282c9`) — pure passthrough now asserts `{calls:0, sawCandidate:false,
+   redacted:false}`;
+3. added shape-B decline tests (arg name in `name`, e.g. `path`/`newString`, must
+   not resolve) plus a `§21-regression` guard.
 
 Fixed during the streaming work: the streaming `drain` was flushing partial openers
 (`<`, `<BAR`, `<BAR BAR DS`) as text instead of holding them — fixed with

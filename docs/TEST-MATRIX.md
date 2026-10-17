@@ -37,6 +37,12 @@ Fixture convention: a **fixture is raw text built at runtime** so we can inject 
 | `v24-json-param` | `param` `string="false"` value `{"a":1}` | args[{a:1}] as object |
 | `v25-raw-json-body` | invoke body `{"a":1}` no params | args `{a:1}` |
 | `v26-wrapped-tool` etc. | markerless/markered outer + complete inners | call X recovered; plain prose / incomplete nesting untouched |
+| `v27-bare-value-rescue` | bare-value orphan `parameter` + orphan closer + resolver key | 1 call (tool name in `name`); closer-swallow strips the trailing closer |
+| `§22-fixed` | real leak (2026-10-17), resolver maps `shell`→`command` | 1 call, `</invoke>` + mangled ` calls>` stripped (text → `""`) |
+| `§22-declines` | same leak, no resolver / unknown tool | 0 calls (never guess a key) |
+| `§22-shape-B` | orphan `parameter name="path"`/`"newString"` (arg name, not tool) | 0 calls — resolver only keys real tool names |
+| `§22-held-prefix` | leak minus its closer | 0 calls, 0 ranges (no authenticity signal) |
+| `§21-regression` | prose merely mentioning `<parameter name="…">` | 0 calls, 0 ranges (fix must not reopen the fork's text-eating bug) |
 | `reject-no-marker` | `"hello world"` | 0 calls, 0 ranges |
 | `reject-not-dsml` | long prose, no marker | fast path (looksLikeDsml false) |
 | `reject-empty-args` | `invoke("bash",[])` | 0 calls (nothing to run) |
@@ -63,6 +69,18 @@ fragment. This row therefore expects `calls: []`, `ranges: [the parameter markup
 | `stream-buffer-cap` | >64 KiB unclosed | fallback to text, no unbounded growth |
 | `stream-eager-stop` | prose opener, no structure | flushed early as text, nothing held |
 | `stream-transition` | reasoning part mid-text | held text flushed first, order preserved |
+
+## Settled stats (`onSettled`)
+
+| ID | Fixture | Expect |
+|----|---------|--------|
+| `settled-recovery-counts` | SSE block with 1 recovered call | `{ calls: 1, sawCandidate: true }`, reported once |
+| `settled-passthrough` | plain SSE text, middleware plain prose | `{ calls: 0, sawCandidate: false, redacted: false }` |
+
+> `redacted` is set when a turn redacted leaked markup it could not recover. The
+> retry safety net reads it because redaction erases the DSML marker from stored
+> text, so `looksLikeDsml(transcript)` is false afterwards — without this flag the
+> wake would never fire for the §22 case.
 
 ## Repair: `recoverStoredMessage(message)`
 

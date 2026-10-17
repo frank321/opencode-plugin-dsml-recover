@@ -277,6 +277,44 @@ describe("§22 real leak — markerless orphan parameter (2026-10-17)", () => {
     expect(r.calls).toHaveLength(0)
   })
 
+  test("§22-declines: arg name in `name` is not a tool — declines", () => {
+    // Shape B (2026-10-17): the degraded envelope carried the ARGUMENT name
+    // (`path`), not the tool name, in the orphan parameter's `name` attribute;
+    // the tool name and sibling args were gone. A resolver that maps tool names
+    // → keys must NOT match `path`, so the rescue declines rather than inventing
+    // a call with the wrong tool. A wrong call is worse than a redaction (§3.D).
+    const argNameShape = text(
+      `<parameter name="path" string="true">`,
+      "/Users/frank/git_repo/opencode-plugin-dsml-recover/src/parse.ts",
+      `</parameter>`,
+      "\n</invoke>\n",
+      closeTag("calls"),
+    )
+    const r = parseDsml(argNameShape, {
+      resolveBareValueKey: (n) => (n === "shell" ? "command" : undefined),
+    })
+    expect(r.calls).toHaveLength(0)
+  })
+
+  test("§22-shape-B: a tool-name-keyed resolver declines for an arg name", () => {
+    // The discriminator against shape B lives in the RESOLVER, not the parser:
+    // the schema-derived resolver only returns a key for real tool names, so an
+    // orphan parameter whose `name` is an ARGUMENT (`newString`) never resolves.
+    // Here the resolver returns a key only for the tool `edit`, so shape B
+    // (`name="newString"`) declines — no call, matching the taxonomy finding.
+    const argNameShape = text(
+      `<parameter name="newString" string="true">`,
+      "const x = 1",
+      `</parameter>`,
+      "\n</invoke>\n",
+      closeTag("calls"),
+    )
+    const r = parseDsml(argNameShape, {
+      resolveBareValueKey: (n) => (n === "edit" ? "newString" : undefined),
+    })
+    expect(r.calls).toHaveLength(0)
+  })
+
   test("§22-held-prefix: no closer yet → no marker, no recovery", () => {
     // The capture-log artefact: at the moment of the drain the closer had not
     // arrived, so this prefix carries no DSML marker at all.

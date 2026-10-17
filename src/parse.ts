@@ -9,6 +9,7 @@
 
 import {
   bareValueParameterRe,
+  BLOCK_TAG,
   blockCloseRe,
   blockOpenRe,
   danglingMarkerRe,
@@ -16,6 +17,7 @@ import {
   invokeCloseRe,
   invokeOpenRe,
   looksLikeDsml,
+  MARKER,
   orphanInvokeRe,
   orphanParameterRe,
   parameterLooseRe,
@@ -271,7 +273,16 @@ function findOrphans(text: string, options: Required<ParseOptions>): Orphan[] {
       if (!key) continue
       const value = decodeValue(body.replace(/^\r?\n/, "").replace(/\r?\n$/, ""), undefined)
       if (typeof value !== "string" || value.length === 0) continue
-      orphans.push({ start: b.start, end: b.end, calls: [{ name, arguments: { [key]: value } }] })
+      // Swallow an immediately-following orphan invoke/block closer so a bare
+      // closer (e.g. a lone invoke end, or a mangled calls end) does not survive
+      // as visible markup. Both real leaks ended with one. Only whitespace may
+      // sit between the parameter close and the closer.
+      const afterCloser = new RegExp(
+        `^[ \\t\\r\\n]*</(?:${MARKER})?(?:invoke|${BLOCK_TAG})[ \\t\\r\\n]*>`,
+        "iu",
+      ).exec(text.slice(b.end))
+      const end = afterCloser ? b.end + afterCloser[0].length : b.end
+      orphans.push({ start: b.start, end, calls: [{ name, arguments: { [key]: value } }] })
     }
   }
 
