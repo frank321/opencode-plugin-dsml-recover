@@ -33,6 +33,23 @@ Three things make it worse than a single failed turn:
 This plugin repairs those leaks inside OpenCode. Good responses pass through
 untouched.
 
+## Trust & behavior
+
+Because this plugin sits in the request/response path, here is exactly what it
+does and does not do:
+
+- **No network calls of its own.** It never contacts a server, telemetry
+  endpoint, or update check.
+- **Reads no credentials.** It never touches API keys, tokens, or provider auth.
+- **Pass-through-safe.** Plain responses are byte-identical; normal text is never
+  held. It only rewrites a span that already looks like leaked tool-call markup.
+  History is only sanitized when a leak is actually present.
+- **No persisted writes.** History repair happens at request time (in memory);
+  the plugin does not mutate your stored messages.
+- **Local diagnostics are opt-in and off by default.** The `debug` and `capture`
+  options write to local files (`stderr` and `/tmp/opencode/dsml-capture.log`).
+  The capture log can contain your session text — delete it when done.
+
 ## What it does
 
 1. **Parse leaked tool calls.** A tolerant parser for complete blocks plus every
