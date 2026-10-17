@@ -17,7 +17,7 @@
 
 import { Plugin } from "@opencode/plugin"
 import { appendFileSync } from "node:fs"
-import { appliesToProvider, resolveConfig, type DsmlPluginOptions } from "./config.ts"
+import { appliesToProvider, bareValueKeyResolver, resolveConfig, type DsmlPluginOptions } from "./config.ts"
 import {
   alreadySent,
   attemptKey,
@@ -62,11 +62,18 @@ export default Plugin.define({
       looseParameters: config.looseParameters,
       rawJsonBody: config.rawJsonBody,
       wrappedTool: config.wrappedTool,
+      bareValueTool: config.bareValueTool,
+      resolveBareValueKey: bareValueKeyResolver(config),
     }
     // Active turn per session: OpenCode's own user-message id, captured on the
     // request and reused by the response so both log lines carry the same
     // `session/message` identity. Attempts count physical requests within a turn.
     const turns = new Map<string, { turn: string; attempts: number }>()
+
+    // Sessions whose most recent primary response redacted leaked markup it
+    // could not recover. The retry safety net must fire for these even though the
+    // stored transcript no longer contains a DSML marker (redaction erases it).
+    const redactedSessions = new Set<string>()
 
     // --- Live response fix: model recovery ------------------------------------
     if (config.responseFixEnabled) {
@@ -101,7 +108,13 @@ export default Plugin.define({
           capture: config.capture,
           onSettled: (stats) => {
             const what =
-              stats.calls > 0 ? `recovered=${stats.calls}` : stats.sawCandidate ? "held-candidate-no-call" : "passthrough"
+              stats.calls > 0
+                ? `recovered=${stats.calls}`
+                : stats.redacted
+                  ? "redacted-no-call"
+                  : stats.sawCandidate
+                    ? "held-candidate-no-call"
+                    : "passthrough"
             log(`response model=${event.model.providerID}/${event.model.id} ${what}`)
           },
         })
@@ -129,12 +142,17 @@ export default Plugin.define({
             bufferLimit: config.bufferLimit,
             capture: config.capture,
             onSettled: (stats) => {
+              // Remember a redaction so the idle wake still fires for this
+              // session despite the marker having been erased from the text.
+              if (stats.redacted) redactedSessions.add(sessionID)
               const what =
                 stats.calls > 0
                   ? `recovered=${stats.calls}`
-                  : stats.sawCandidate
-                    ? "held-candidate-no-call"
-                    : "passthrough"
+                  : stats.redacted
+                    ? "redacted-no-call"
+                    : stats.sawCandidate
+                      ? "held-candidate-no-call"
+                      : "passthrough"
               log(`response ${label} ${what}`)
             },
           })
@@ -220,7 +238,7 @@ export default Plugin.define({
           if (!idle && !statusIdle) continue
           const sessionID = (raw as { sessionID?: unknown }).sessionID
           if (typeof sessionID !== "string") continue
-          await maybeWake(ctx, config, log, sessionID).catch((error) => log("wake failed", error))
+          await maybeWake(ctx, config, log, sessionID, redactedSessions).catch((error) => log("wake failed", error))
         }
       } catch {
         // Aborted on unload.
@@ -238,6 +256,7 @@ async function maybeWake(
   config: Config,
   log: (...args: unknown[]) => void,
   sessionID: string,
+  redactedSessions: Set<string>,
 ): Promise<void> {
   const messages = await ctx.session.context({ sessionID })
   const last = [...messages].reverse().find((message) => message.type === "assistant")
@@ -249,11 +268,14 @@ async function maybeWake(
   if (!text) return
   const key = attemptKey(sessionID, last.id)
   const sent = alreadySent(await ctx.storage.get(key))
-  const decision = decideResume(text, sent)
+  const redactionSeen = redactedSessions.has(sessionID)
+  const decision = decideResume(text, sent, redactionSeen)
   if (!decision.send || !decision.text) {
     if (decision.reason && decision.reason !== "no-marker") log(decision.reason, "for", last.id)
     return
   }
+  // Clear the flag once consumed so a later unrelated idle does not re-wake.
+  redactedSessions.delete(sessionID)
   await ctx.storage.set(key, true)
   if (config.retryChannel === "user") {
     // The full correction travels as a synthetic user turn.

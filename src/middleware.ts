@@ -43,6 +43,13 @@ export interface DsmlStats {
   readonly calls: number
   /** Whether any DSML candidate was ever held (false = pure passthrough). */
   readonly sawCandidate: boolean
+  /**
+   * Whether this turn REDACTED markup it could not recover. Needed by the retry
+   * safety net: redaction erases the DSML marker from the stored text, so
+   * `looksLikeDsml(transcript)` is false afterwards and the nudge would never
+   * fire without this signal (§22). Default false.
+   */
+  readonly redacted?: boolean
 }
 
 const DEFAULT_BUFFER_LIMIT = 64 * 1024
@@ -148,6 +155,8 @@ export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): Langu
     looseParameters: input?.looseParameters,
     rawJsonBody: input?.rawJsonBody,
     wrappedTool: input?.wrappedTool,
+    bareValueTool: input?.bareValueTool,
+    resolveBareValueKey: input?.resolveBareValueKey,
   }
   return {
     specificationVersion: "v3",
@@ -159,6 +168,7 @@ export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): Langu
       let recovered = false
       let recoveredInBlock = false
       let sawCandidate = false
+      let redacted = false
       let settled = false
       let counter = 0
 
@@ -191,7 +201,7 @@ export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): Langu
       const settle = () => {
         if (settled) return
         settled = true
-        input?.onSettled?.({ calls: counter, sawCandidate })
+        input?.onSettled?.({ calls: counter, sawCandidate, redacted })
       }
 
       const enqueueCall = (controller: TransformStreamDefaultController<LanguageModelV3StreamPart>, call: DsmlToolCall) => {
@@ -317,9 +327,10 @@ export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): Langu
           // never closed is a runt — redact it rather than emitting raw markup.
           // The old verbatim flush is a primary way DSML tags reach the chat.
           const { ranges: overRanges } = parseDsml(textBuffer, parseOptions)
-          const redacted = overRanges.length > 0 ? stripRangesWithNote(textBuffer, overRanges, redactionNote([])) : textBuffer
-          captureEmit(captureOn, "aisdk", "over-cap-flush", redacted, { cap: bufferLimit, len: textBuffer.length, ranges: overRanges.length })
-          if (redacted.length > 0) controller.enqueue({ type: "text-delta", id: textId, delta: redacted })
+          const redactedText = overRanges.length > 0 ? stripRangesWithNote(textBuffer, overRanges, redactionNote([])) : textBuffer
+          if (overRanges.length > 0) redacted = true
+          captureEmit(captureOn, "aisdk", "over-cap-flush", redactedText, { cap: bufferLimit, len: textBuffer.length, ranges: overRanges.length })
+          if (redactedText.length > 0) controller.enqueue({ type: "text-delta", id: textId, delta: redactedText })
           textBuffer = ""
           return
         }
@@ -341,14 +352,15 @@ export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): Langu
         // long context. Genuine prose never carries `ranges`, so it is untouched.
         if (calls.length === 0) {
           if (ranges.length > 0) {
-            const redacted = stripRangesWithNote(original, ranges, redactionNote([]))
-            captureEmit(captureOn, "aisdk", "emit-resolved-unresolved-redacted", redacted, {
+            const redactedText = stripRangesWithNote(original, ranges, redactionNote([]))
+            redacted = true
+            captureEmit(captureOn, "aisdk", "emit-resolved-unresolved-redacted", redactedText, {
               final: isFinal,
               recoveredCalls: 0,
               ranges: ranges.length,
               cap: bufferLimit,
             })
-            if (redacted.length > 0) controller.enqueue({ type: "text-delta", id: textId, delta: redacted })
+            if (redactedText.length > 0) controller.enqueue({ type: "text-delta", id: textId, delta: redactedText })
             return
           }
           captureEmit(captureOn, "aisdk", "emit-resolved-no-call", original, {
@@ -504,6 +516,8 @@ export function wrapDsmlLanguageModel(model: LanguageModelV3, input?: DsmlMiddle
     looseParameters: input?.looseParameters,
     rawJsonBody: input?.rawJsonBody,
     wrappedTool: input?.wrappedTool,
+    bareValueTool: input?.bareValueTool,
+    resolveBareValueKey: input?.resolveBareValueKey,
   }
   return {
     specificationVersion: "v3",

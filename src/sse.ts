@@ -37,6 +37,14 @@ export interface SseStats {
   readonly calls: number
   /** Whether any DSML candidate was ever held (false = pure passthrough). */
   readonly sawCandidate: boolean
+  /**
+   * Whether this turn REDACTED leaked markup it could not recover. The retry
+   * safety net needs this: redaction erases the DSML marker from the stored
+   * text, so `looksLikeDsml(transcript)` is false afterwards and the nudge
+   * would never fire. Recording it here restores the wake for exactly the case
+   * the live fix failed to recover (§22). Default false.
+   */
+  readonly redacted?: boolean
 }
 
 const DEFAULT_BUFFER_LIMIT = 64 * 1024
@@ -151,6 +159,7 @@ export class SseDsmlRewriter {
   private maxNativeIndex = -1
   private sawCandidate = false
   private settled = false
+  private redacted = false
   private readonly bufferLimit: number
   private readonly parseOptions: ParseOptions
   private readonly onSettled?: (stats: SseStats) => void
@@ -165,6 +174,8 @@ export class SseDsmlRewriter {
       looseParameters: input?.looseParameters,
       rawJsonBody: input?.rawJsonBody,
       wrappedTool: input?.wrappedTool,
+      bareValueTool: input?.bareValueTool,
+      resolveBareValueKey: input?.resolveBareValueKey,
     }
   }
 
@@ -176,7 +187,7 @@ export class SseDsmlRewriter {
   settle(): void {
     if (this.settled) return
     this.settled = true
-    this.onSettled?.({ calls: this.toolIndex, sawCandidate: this.sawCandidate })
+    this.onSettled?.({ calls: this.toolIndex, sawCandidate: this.sawCandidate, redacted: this.redacted })
   }
 
   /** Feed upstream bytes; returns rewritten SSE frames to send downstream. */
@@ -275,6 +286,7 @@ export class SseDsmlRewriter {
       // Prose never carries ranges, so it passes through unchanged.
       if (ranges.length > 0) {
         const redacted = stripRangesWithNote(original, ranges, redactionNote([]))
+        this.redacted = true
         captureEmit(this.captureOn, "sse", "emit-resolved-unresolved-redacted", redacted, {
           final,
           recoveredCalls: 0,
@@ -426,6 +438,7 @@ export class SseDsmlRewriter {
       // markup — the verbatim flush is a primary DSML leak path.
       const { ranges: overRanges } = parseDsml(this.textBuffer, this.parseOptions)
       const redacted = overRanges.length > 0 ? stripRangesWithNote(this.textBuffer, overRanges, redactionNote([])) : this.textBuffer
+      if (overRanges.length > 0) this.redacted = true
       captureEmit(this.captureOn, "sse", "over-cap-flush", redacted, { cap: this.bufferLimit, len: this.textBuffer.length, ranges: overRanges.length })
       this.emitText(redacted, out)
       this.textBuffer = ""

@@ -28,6 +28,26 @@ export interface DsmlPluginOptions {
     rawJsonBody?: boolean
     /** Orphan `<parameter name="X">` with complete inner params. Default true. */
     wrappedTool?: boolean
+    /**
+     * Recover a bare-value orphan parameter (V27, §22 real leak):
+     * `<parameter name="X">VALUE</parameter>` with no inner params, followed by
+     * an orphan invoke/block closer. Default true.
+     *
+     * The argument KEY is not in the bytes, so recovery needs a schema-derived
+     * key from `bareValueKeys`; a tool not in that map is NOT recovered (it falls
+     * through to redaction). See `bareValueKeys`.
+     */
+    bareValueTool?: boolean
+    /**
+     * Tool-name → argument-key map for the bare-value rescue (V27). A tool is
+     * only recovered when it appears here, because the leaked bytes carry the
+     * value but not its key, and a wrong key is worse than a redaction.
+     *
+     * Defaults to the OpenCode tools with exactly ONE required string argument
+     * (`shell`→`command`, `websearch`→`query`). Extend it for custom agents; set
+     * a tool to `null` to explicitly exclude it.
+     */
+    bareValueKeys?: Record<string, string>
   }
   /** History sanitization: strip leaked spans from replayed assistant text. */
   history?: {
@@ -81,6 +101,8 @@ export interface ResolvedDsmlConfig {
   readonly looseParameters: boolean
   readonly rawJsonBody: boolean
   readonly wrappedTool: boolean
+  readonly bareValueTool: boolean
+  readonly bareValueKeys: Readonly<Record<string, string>>
   readonly bufferLimit: number
   readonly responseFixEnabled: boolean
   readonly sanitizeEnabled: boolean
@@ -93,6 +115,19 @@ export interface ResolvedDsmlConfig {
 
 const DEFAULT_PROVIDERS = ["opencode-go", "opencode"] as const
 
+/**
+ * OpenCode tools whose schema has exactly ONE required string argument, so a
+ * bare leaked value can be bound to a key without guessing. Verified against
+ * `packages/core/src/tool/plugin/*.ts` (2026-10-17): these are the only built-in
+ * tools where the key is unambiguous (`edit` needs 3 args, `write`/`subagent`
+ * need several, `read`/`glob`/`grep`/`skill` require none → all excluded).
+ * Extend via `parse.bareValueKeys` for custom agents; the map is additive.
+ */
+const DEFAULT_BARE_VALUE_KEYS: Readonly<Record<string, string>> = {
+  shell: "command",
+  websearch: "query",
+}
+
 export function resolveConfig(input: DsmlPluginOptions = {}): ResolvedDsmlConfig {
   const parse = input.parse ?? {}
   const history = input.history ?? {}
@@ -104,6 +139,8 @@ export function resolveConfig(input: DsmlPluginOptions = {}): ResolvedDsmlConfig
     looseParameters: parse.looseParameters ?? true,
     rawJsonBody: parse.rawJsonBody ?? true,
     wrappedTool: parse.wrappedTool ?? true,
+    bareValueTool: parse.bareValueTool ?? true,
+    bareValueKeys: { ...DEFAULT_BARE_VALUE_KEYS, ...(parse.bareValueKeys ?? {}) },
     bufferLimit: responseFix.bufferLimit ?? 64 * 1024,
     responseFixEnabled: responseFix.enabled ?? true,
     sanitizeEnabled: history.sanitize ?? true,
@@ -113,6 +150,11 @@ export function resolveConfig(input: DsmlPluginOptions = {}): ResolvedDsmlConfig
     debug: input.debug ?? false,
     capture: input.capture ?? false,
   }
+}
+
+/** Build the V27 key resolver from the resolved config. tools absent → decline. */
+export function bareValueKeyResolver(config: ResolvedDsmlConfig): (toolName: string) => string | undefined {
+  return (toolName: string) => config.bareValueKeys[toolName]
 }
 
 /** Whether this model/provider pair is in scope. Matches provider ID exactly. */

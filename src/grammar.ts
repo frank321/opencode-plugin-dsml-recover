@@ -118,6 +118,34 @@ export const wrappedToolRe = (): RegExp =>
   )
 
 /**
+ * A bare-value orphan parameter (V27, §22 real leak): an orphan
+ * `<parameter name="X">VALUE</parameter>` whose body is a **bare value** (no
+ * inner marker-tagged children — that is V26) and which is closed by a real
+ * `</parameter>` **and** followed by an orphan invoke/block closer OR a
+ * marker-bearing block closer.
+ *
+ * This is the shape where the provider dropped the block opener AND the
+ * `invoke name=` opener, keeping only the tool name in the `parameter`
+ * attribute and the (keyless) value. It is NOT prose: the trailing closer is
+ * the authenticity signal — prose does not close an `<invoke>` it never opened.
+ *
+ * The grammar captures `(name, value)`; the CALLER binds the value to a key
+ * (see `ParseOptions.resolveBareValueKey`) because the key is not in the bytes.
+ * Grammar-level authenticity (the closer) is necessary but not sufficient;
+ * resolution also requires a schema-derived key, else nothing is recovered.
+ *
+ * Groups: [1] = tool name, [2] = value.
+ */
+export const bareValueParameterRe = (): RegExp =>
+  new RegExp(
+    `<(?:${MARKER})?parameter\\s+name\\s*=\\s*["']?([^"'\\s>]+)["']?[^>]*>` +
+      `([\\s\\S]*?)` +
+      `</(?:${MARKER})?parameter\\s*>` +
+      `(?=[\\s\\S]*?</(?:${MARKER})?(?:invoke|${BLOCK_TAG})\\b|$)`,
+    "giu",
+  )
+
+/**
  * Any DSML-looking tag at all — used to strip fragments that never formed a full
  * call (stray opens, orphan closers, a bare `parameter` with no invoke). (V9, V10, V12)
  */

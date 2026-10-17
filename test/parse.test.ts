@@ -248,44 +248,75 @@ describe("§22 real leak — markerless orphan parameter (2026-10-17)", () => {
   // The held-buffer prefix (closer not yet arrived) — what the capture log showed.
   const heldPrefix = realLeak.slice(0, realLeak.length - closeTag("calls").length)
 
-  test("§22-gap: the real leak is currently NOT recovered (documents the escape)", () => {
-    // Bite proof, mirroring §18.3: asserts the CURRENT (broken) behaviour so the fix
-    // flips it. When the §22.6 rescue lands, update this to expect recoveredCalls=1.
-    const r = parseDsml(realLeak)
-    expect(r.calls).toHaveLength(0)
-    // The marker IS present (in the closer), so looksLikeDsml passes and the mangled
-    // closer is ranged away — but no call is produced. This is the exact
-    // `emit-resolved-unresolved-redacted` state observed live.
-    expect(r.ranges.length).toBeGreaterThan(0)
+  test("§22-fixed: the real leak recovers when the tool schema supplies the key", () => {
+    // The fix: a bare-value orphan parameter + orphan closer, WITH a schema-derived
+    // key for the tool, becomes a real call. `shell`→`command` is the actual case.
+    const r = parseDsml(realLeak, { resolveBareValueKey: (n) => (n === "shell" ? "command" : undefined) })
+    const call = one(r)
+    expect(call.name).toBe("shell")
+    expect(call.arguments).toEqual({
+      command:
+        "cd /Users/frank/git_repo/hermes-stock-watch && .venv/bin/python -m pytest " +
+        "tests/test_deploy_scripts.py::test_archive_excludes_secrets_and_state -q 2>&1 | tail -18",
+    })
+    // Both the parameter element and the orphan closer are stripped from the text.
+    expect(stripRanges(realLeak, r.ranges)).toBe("")
   })
 
-  test("§22 held-buffer prefix has no marker yet (capture-log artefact)", () => {
-    // Explains why the first pass mis-read this: at the moment of the fork's drain,
-    // the closer had not arrived, so this prefix contains no DSML marker at all.
-    const r = parseDsml(heldPrefix)
+  test("§22-declines: no resolver → no call (never guess a key)", () => {
+    // Without a resolver the rescue declines and falls through to redaction,
+    // reproducing the original miss. This is the §3.D invariant: an unresolvable
+    // key must NOT be invented.
+    const r = parseDsml(realLeak)
+    expect(r.calls).toHaveLength(0)
+  })
+
+  test("§22-declines: an unknown tool name is not recovered", () => {
+    const src = realLeak.replace(`name="shell"`, `name="mystery_tool"`)
+    const r = parseDsml(src, { resolveBareValueKey: (n) => (n === "shell" ? "command" : undefined) })
+    expect(r.calls).toHaveLength(0)
+  })
+
+  test("§22-held-prefix: no closer yet → no marker, no recovery", () => {
+    // The capture-log artefact: at the moment of the drain the closer had not
+    // arrived, so this prefix carries no DSML marker at all.
+    const r = parseDsml(heldPrefix, { resolveBareValueKey: (n) => (n === "shell" ? "command" : undefined) })
     expect(r.calls).toHaveLength(0)
     expect(r.ranges).toHaveLength(0)
   })
 
-  test("§22-discriminator: a trailing orphan `</invoke>` is the authenticity signal", () => {
-    // The near-conclusive signal that this markerless `<parameter>` is a real call,
-    // not prose (§22.5 signal 1). Asserted here so the fix has a documented hook;
-    // prose does not close an invoke it never opened.
+  test("§22-discriminator: a trailing orphan closer is the authenticity signal", () => {
+    // Prose does not close an invoke it never opened; the closer + resolver is
+    // what separates a real call from quoted markup.
     expect(realLeak).toContain(`</invoke>`)
   })
 
   test("§21 regression guard: quoted markerless prose must stay untouched", () => {
     // The §22 fix must NOT reopen §21 (the fork eating quoted text). Prose that
-    // merely mentions `<parameter name="…">` with no orphan invoke closer and no
-    // block closer must remain byte-identical and recover zero calls.
+    // merely mentions `<parameter name="…">` with no orphan invoke/block closer
+    // must remain byte-identical and recover zero calls — even WITH a resolver.
     const prose = text(
       "An HTML ",
-      `<parameter name="foo">`,
-      " element is not a DSML tool call.",
+      `<parameter name="shell">`,
+      "attribute is documented here.",
     )
-    const r = parseDsml(prose)
+    const r = parseDsml(prose, { resolveBareValueKey: (n) => (n === "shell" ? "command" : undefined) })
     expect(r.calls).toHaveLength(0)
     expect(r.ranges).toHaveLength(0)
+  })
+
+  test("v27-with-inner-params goes to V26, not the bare-value rescue", () => {
+    // Guard the boundary: a body with complete inner params is V26 territory and
+    // must not be double-claimed by the bare-value rescue.
+    const src = text(
+      `<parameter name="edit">`,
+      param("path", "f.kt"),
+      `${closeTag("invoke")}`,
+    )
+    const r = parseDsml(src, { resolveBareValueKey: () => "command" })
+    const call = one(r)
+    expect(call.name).toBe("edit")
+    expect(call.arguments).toEqual({ path: "f.kt" })
   })
 })
 
