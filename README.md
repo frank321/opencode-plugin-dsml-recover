@@ -5,7 +5,7 @@ plugin — tested with **DeepSeek V4.1 via the DeepInfra provider**.
 
 ## Scope & tested configuration
 
-**OpenCode only**, and **tested with DeepSeek V4.1 via the DeepInfra provider** —
+**OpenCode V2 only**, and **tested with DeepSeek V4.1 via the DeepInfra provider** —
 that is the setup this was built and verified against. It may help on other
 providers or models, but they have not been tested: this is a personal fix shared
 in the hope it saves someone else the same frustration, not a supported matrix.
@@ -80,14 +80,16 @@ project's own testing was DeepSeek V4.1 on DeepInfra — see Scope above.)
 ## Install
 
 ```sh
-# from npm (upstream name; this fork is not published yet)
-opencode plugin add opencode-plugin-dsml-fix
+# from npm (this fork's name)
+opencode plugin add opencode-plugin-dsml-recover
 
-# local checkout (what we run): point the config at the directory
+# or point OpenCode at a local checkout
 #   "package": "file:///path/to/opencode-plugin-dsml-recover"
 ```
 
-- **OpenCode V2** (`2.0.x`).
+- **Requires OpenCode V2** (`2.0.x` API). **Not compatible with OpenCode V1** —
+  this plugin uses the V2 plugin API (`@opencode/plugin`, captured against
+  `2.0.22`). It will not load on the V1 track.
 - **Tested:** DeepSeek V4.1 via DeepInfra. Set `providers` to match your setup —
   e.g. `"providers": ["deepinfra"]`.
 - Defaults have everything enabled: `parse`, `history`, `responseFix`, `retry`.
