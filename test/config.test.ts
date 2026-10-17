@@ -1,7 +1,7 @@
 /** Config defaults, per-shape parse flags, prompt guards, and retry decisions. */
 
 import { describe, expect, test } from "bun:test"
-import { appliesToProvider, resolveConfig } from "../src/config.ts"
+import { appliesToProvider, mergeBareValueKeys, resolveConfig, schemaBareValueKeys } from "../src/config.ts"
 import { alreadySent, attemptKey, decideResume, messageText, needsSystemNudge, nudgeCapKey, turnId, wakeText } from "../src/fallback.ts"
 import { block, invoke, param } from "./fixtures.ts"
 import { parseDsml, redactionNote, stripRangesWithNote } from "../src/parse.ts"
@@ -79,6 +79,85 @@ describe("parse flags", () => {
     const r = parseDsml(src, allOff)
     // Without the tolerant scan the strict result stands (runaway value).
     expect(r.calls.map((c) => c.name)).toEqual(["r"])
+  })
+})
+
+describe("schema-aware bare-value keys (§22 V27)", () => {
+  // Real shapes from the live tool list (12 tools) captured 2026-10-17.
+  const tools = {
+    shell: {
+      input: {
+        type: "object",
+        properties: {
+          command: { type: "string" },
+          workdir: { type: "string" },
+          timeout: { type: "number" },
+          background: { type: "boolean" },
+        },
+        required: ["command"],
+      },
+    },
+    websearch: {
+      input: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+    },
+    read: {
+      input: { type: "object", properties: { filePath: { type: "string" } }, required: ["filePath"] },
+    },
+    edit: {
+      input: {
+        type: "object",
+        properties: { filePath: { type: "string" }, oldString: { type: "string" }, newString: { type: "string" } },
+        required: ["filePath", "oldString", "newString"],
+      },
+    },
+    grep: {
+      input: { type: "object", properties: { pattern: { type: "string" } } }, // no `required`
+    },
+    subagent: {
+      input: { type: "object", properties: { prompt: { type: "string" }, n: { type: "number" } }, required: ["prompt", "n"] },
+    },
+  }
+
+  test("single required string arg → keyed", () => {
+    const keys = schemaBareValueKeys(tools)
+    expect(keys.shell).toBe("command")
+    expect(keys.websearch).toBe("query")
+    expect(keys.read).toBe("filePath")
+  })
+
+  test("multi-required / no-required / non-string → declined", () => {
+    const keys = schemaBareValueKeys(tools)
+    expect(keys.edit).toBeUndefined()
+    expect(keys.grep).toBeUndefined()
+    expect(keys.subagent).toBeUndefined()
+  })
+
+  test("absent tools → empty map (decline everything)", () => {
+    expect(schemaBareValueKeys(undefined)).toEqual({})
+  })
+
+  test("non-object schema (e.g. bare string) → declined", () => {
+    const keys = schemaBareValueKeys({ weird: { input: { type: "string" } } })
+    expect(keys.weird).toBeUndefined()
+  })
+
+  test("merge: live schema keys override/supplement the static fallback", () => {
+    const config = resolveConfig() // static: shell→command, websearch→query
+    const merged = mergeBareValueKeys(config, tools)
+    expect(merged.shell).toBe("command")
+    expect(merged.read).toBe("filePath") // live-only addition
+    expect(merged.edit).toBeUndefined()
+  })
+
+  test("a leaked bare value recovers end-to-end with schema-derived keys", () => {
+    // §22 real-leak shape, but keyed from the LIVE schema rather than config.
+    const leaked =
+      `<parameter name="read">` + "/etc/hosts" + `</parameter>\n</invoke>\n</\uFF5CDSML\uFF5Ccalls>`
+    const keys = mergeBareValueKeys(resolveConfig(), tools)
+    const r = parseDsml(leaked, { resolveBareValueKey: (n) => keys[n] })
+    expect(r.calls).toHaveLength(1)
+    expect(r.calls[0]!.name).toBe("read")
+    expect(r.calls[0]!.arguments).toEqual({ filePath: "/etc/hosts" })
   })
 })
 

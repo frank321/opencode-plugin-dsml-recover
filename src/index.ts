@@ -17,7 +17,13 @@
 
 import { Plugin } from "@opencode/plugin"
 import { appendFileSync } from "node:fs"
-import { appliesToProvider, bareValueKeyResolver, resolveConfig, type DsmlPluginOptions } from "./config.ts"
+import {
+  appliesToProvider,
+  bareValueKeyResolver,
+  mergeBareValueKeys,
+  resolveConfig,
+  type DsmlPluginOptions,
+} from "./config.ts"
 import {
   alreadySent,
   attemptKey,
@@ -65,6 +71,18 @@ export default Plugin.define({
       bareValueTool: config.bareValueTool,
       resolveBareValueKey: bareValueKeyResolver(config),
     }
+    // Tool-name → argument-key map per session, derived from the live tool
+    // schemas seen on the `context` hook (which runs before the response hooks).
+    // The response hooks have no access to the tool list, so the schema-aware
+    // keys are stashed here and looked up by session id (§22 V27, schema-aware).
+    const sessionBareValueKeys = new Map<string, Record<string, string>>()
+
+    /** Parse options with the session's schema-derived bare-value keys merged in. */
+    const parseOptionsFor = (sessionID: string | undefined): ParseOptions => {
+      const keys = sessionID ? sessionBareValueKeys.get(sessionID) : undefined
+      if (!keys || Object.keys(keys).length === 0) return parseOptions
+      return { ...parseOptions, resolveBareValueKey: (toolName: string) => keys[toolName] }
+    }
     // Active turn per session: OpenCode's own user-message id, captured on the
     // request and reused by the response so both log lines carry the same
     // `session/message` identity. Attempts count physical requests within a turn.
@@ -100,6 +118,10 @@ export default Plugin.define({
           log("no language model to wrap for", event.model.providerID, event.model.id)
           return
         }
+        // NB: this AI-SDK hook carries no session id, so the schema-derived keys
+        // cached by the `context` hook cannot be applied here. That is fine for
+        // the catalog route the leak appears on (native SSE, handled below); this
+        // path keeps the static config keys only.
         event.language = wrapDsmlLanguageModel(base, {
           ...parseOptions,
           stream: true,
@@ -138,7 +160,7 @@ export default Plugin.define({
         const label = `${sessionID}/${slot.turn}#${slot.attempts}`
         try {
           event.response = rewriteSseResponse(event.response, {
-            ...parseOptions,
+            ...parseOptionsFor(sessionID),
             bufferLimit: config.bufferLimit,
             capture: config.capture,
             onSettled: (stats) => {
@@ -165,6 +187,14 @@ export default Plugin.define({
     // --- Request shaping: sanitize + conditional nudge -------------------------
     await ctx.session.hook("context", async (event) => {
       if (!appliesToProvider(config, event.model.providerID)) return
+      // Cache the schema-derived bare-value keys for this session so the
+      // response hooks (which lack the tool list) can recover a bare leaked
+      // value (§22 V27). `context` runs before the response — verified against a
+      // live turn. Static config keys still apply as a fallback.
+      if (config.bareValueTool) {
+        const merged = mergeBareValueKeys(config, event.tools)
+        sessionBareValueKeys.set(event.sessionID, merged)
+      }
       // A new user message starts a new turn: reset the attempt counter so the
       // response lines for this turn share one `session/message` identity.
       const turn = turnId(event.messages)

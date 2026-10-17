@@ -104,7 +104,26 @@ only), and the markerless outer opener needing candidate-hold in the stream.
 
 ## 6. Current test state
 
-`bun test` → **123/123 pass** (6 files). `./node_modules/.bin/tsc --noEmit` → clean.
+`bun test` → **131/131 pass** (6 files). `./node_modules/.bin/tsc --noEmit` → clean.
+
+**Schema-aware bare-value keys (2026-10-17, this session):** the V27 rescue
+originally keyed off a **static allowlist** (`bareValueKeys`: `shell`→`command`,
+`websearch`→`query`), so any tool outside it fell through to redaction. Now the
+key is **derived from the session's live tool schema**: the `context` hook
+receives `SessionContext.tools` (name + JSON `input`), and a tool qualifies when
+its input is an object with **exactly one required string property**
+(`schemaBareValueKeys` in `src/config.ts`). The map is cached per `sessionID` and
+consumed by the `http.response` hook (verified: `context` runs ~450 ms *before*
+`http.response` for the same session; probe 2026-10-17T15:59Z).
+
+- Covers every single-required-arg tool generically (`read`→`filePath` also now
+  recovers), not just the two hardcoded ones.
+- Still **declines** multi-arg tools (`edit` → 3 required) and the **arg-name
+  shape** (`name="path"`) where no tool name exists in the bytes — those need the
+  proxy / a heuristic, not this fix.
+- The `aisdk.language` hook carries **no session id**, so it keeps static keys
+  only; the leak appears on the native SSE route (`http.response`), which has the
+  id. Documented at the hook.
 
 **§22 / V27 session (2026-10-17):** completed the parked WIP (`7a3583c`). The
 orphan-closer-swallow edit was finished — it referenced `MARKER`/`BLOCK_TAG`

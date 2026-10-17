@@ -37,12 +37,15 @@ Fixture convention: a **fixture is raw text built at runtime** so we can inject 
 | `v24-json-param` | `param` `string="false"` value `{"a":1}` | args[{a:1}] as object |
 | `v25-raw-json-body` | invoke body `{"a":1}` no params | args `{a:1}` |
 | `v26-wrapped-tool` etc. | markerless/markered outer + complete inners | call X recovered; plain prose / incomplete nesting untouched |
-| `v27-bare-value-rescue` | bare-value orphan `parameter` + orphan closer + resolver key | 1 call (tool name in `name`); closer-swallow strips the trailing closer |
-| `§22-fixed` | real leak (2026-10-17), resolver maps `shell`→`command` | 1 call, `</invoke>` + mangled ` calls>` stripped (text → `""`) |
+| `v27-bare-value-rescue` | bare-value orphan `parameter` + orphan closer + resolver key | 1 call (tool name in `name`); closer-swallow strips the trailing closer || `§22-fixed` | real leak (2026-10-17), resolver maps `shell`→`command` | 1 call, `</invoke>` + mangled ` calls>` stripped (text → `""`) |
 | `§22-declines` | same leak, no resolver / unknown tool | 0 calls (never guess a key) |
 | `§22-shape-B` | orphan `parameter name="path"`/`"newString"` (arg name, not tool) | 0 calls — resolver only keys real tool names |
 | `§22-held-prefix` | leak minus its closer | 0 calls, 0 ranges (no authenticity signal) |
 | `§21-regression` | prose merely mentioning `<parameter name="…">` | 0 calls, 0 ranges (fix must not reopen the fork's text-eating bug) |
+| `schema-keys-single-arg` | tool schema: one required string arg | keyed (`shell`→`command`, `read`→`filePath`, `websearch`→`query`) |
+| `schema-keys-multi-none-nonstring` | 3-required / no-`required` / non-string prop | declined (no key) |
+| `schema-keys-absent-tools` | no tool list | empty map → decline everything |
+| `schema-keys-merge` | live schema over static `bareValueKeys` | live key wins; live-only tools added |
 | `reject-no-marker` | `"hello world"` | 0 calls, 0 ranges |
 | `reject-not-dsml` | long prose, no marker | fast path (looksLikeDsml false) |
 | `reject-empty-args` | `invoke("bash",[])` | 0 calls (nothing to run) |

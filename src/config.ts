@@ -33,19 +33,22 @@ export interface DsmlPluginOptions {
      * `<parameter name="X">VALUE</parameter>` with no inner params, followed by
      * an orphan invoke/block closer. Default true.
      *
-     * The argument KEY is not in the bytes, so recovery needs a schema-derived
-     * key from `bareValueKeys`; a tool not in that map is NOT recovered (it falls
-     * through to redaction). See `bareValueKeys`.
+     * The argument KEY is not in the bytes, so recovery needs a key derived from
+     * the session's live tool schema (any tool whose input has exactly one
+     * required string arg — `shell`→`command`, `read`→`filePath`). Absent a
+     * derivable key the tool is NOT recovered (it falls through to redaction).
+     * `bareValueKeys` is a static fallback for schemas the walker cannot read.
      */
     bareValueTool?: boolean
     /**
-     * Tool-name → argument-key map for the bare-value rescue (V27). A tool is
-     * only recovered when it appears here, because the leaked bytes carry the
-     * value but not its key, and a wrong key is worse than a redaction.
+     * Static tool-name → argument-key fallback for the bare-value rescue (V27).
+     * The primary source is the live tool schema seen on the `context` hook;
+     * this map is merged UNDER it, so it only fills gaps (custom agents, tools
+     * whose schema the walker cannot parse). A wrong key is worse than a
+     * redaction (§3.D).
      *
-     * Defaults to the OpenCode tools with exactly ONE required string argument
-     * (`shell`→`command`, `websearch`→`query`). Extend it for custom agents; set
-     * a tool to `null` to explicitly exclude it.
+     * Defaults to the known single-required-string OpenCode tools
+     * (`shell`→`command`, `websearch`→`query`).
      */
     bareValueKeys?: Record<string, string>
   }
@@ -155,6 +158,52 @@ export function resolveConfig(input: DsmlPluginOptions = {}): ResolvedDsmlConfig
 /** Build the V27 key resolver from the resolved config. tools absent → decline. */
 export function bareValueKeyResolver(config: ResolvedDsmlConfig): (toolName: string) => string | undefined {
   return (toolName: string) => config.bareValueKeys[toolName]
+}
+
+/** Minimal JSON-Schema shape needed to read a tool's input schema. */
+interface JsonSchemaLike {
+  readonly type?: unknown
+  readonly properties?: Record<string, JsonSchemaLike>
+  readonly required?: readonly unknown[]
+}
+
+/**
+ * Derive the tool-name → argument-key map from the session's live tool schemas
+ * (`SessionContext.tools`), replacing the static `bareValueKeys` allowlist.
+ *
+ * A tool qualifies ONLY when its input schema is a plain object with exactly one
+ * required property, and that property is a string. Then a bare leaked value has
+ * exactly one place to go, so binding it is not a guess: `shell`→`command`,
+ * `read`→`filePath`, `websearch`→`query`. Every other shape declines — a wrong
+ * key is worse than a redaction (§3.D). The static config map is merged in as a
+ * fallback so custom agents with unusual schemas can still be listed by hand;
+ * an explicit `null` in config would be a future exclusion (not yet supported).
+ */
+export function schemaBareValueKeys(
+  tools: Record<string, { readonly input?: JsonSchemaLike }> | undefined,
+): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (!tools) return out
+  for (const [toolName, tool] of Object.entries(tools)) {
+    const schema = tool?.input
+    if (!schema || schema.type !== "object") continue
+    const required = Array.isArray(schema.required) ? schema.required : []
+    if (required.length !== 1) continue
+    const key = required[0]
+    if (typeof key !== "string") continue
+    const prop = schema.properties?.[key]
+    if (!prop || prop.type !== "string") continue
+    out[toolName] = key
+  }
+  return out
+}
+
+/** Merge the live schema-derived keys over the static config fallback. */
+export function mergeBareValueKeys(
+  config: ResolvedDsmlConfig,
+  tools: Record<string, { readonly input?: JsonSchemaLike }> | undefined,
+): Record<string, string> {
+  return { ...config.bareValueKeys, ...schemaBareValueKeys(tools) }
 }
 
 /** Whether this model/provider pair is in scope. Matches provider ID exactly. */
