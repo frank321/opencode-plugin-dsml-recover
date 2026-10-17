@@ -219,6 +219,61 @@ describe("parseDsml — variants", () => {
   })
 })
 
+/**
+ * §22 — the FIRST REAL FIELD LEAK (2026-10-17T07:02:22Z, DeepInfra
+ * DeepSeek-V4.1-Flash, long interactive session). Captured verbatim from the
+ * fork's capture log; see server-manager docs/DSML_FIX_DESIGN.md §22.
+ *
+ * The provider dropped the outer block wrapper, the `invoke` opener, AND every
+ * `DSML` marker — leaving only a markerless `<parameter name="shell">` with a
+ * raw value and an orphan `</invoke>`. This is the "markerless orphan parameter
+ * with a value" shape class (§22.5), NOT the V26 wrapped-tool shape.
+ *
+ * The bytes are rebuilt at runtime (no literal marker token is stored, per
+ * test/fixtures.ts) — but note the point of this fixture: there IS no marker.
+ */
+describe("§22 real leak — markerless orphan parameter (2026-10-17)", () => {
+  // The verbatim capture: a shell tool call whose wrapper + invoke opener + all
+  // markers were stripped by the provider. `hermes-stock-watch` command retained.
+  const realLeak = text(
+    `<parameter name="shell">`,
+    "cd /Users/frank/git_repo/hermes-stock-watch && .venv/bin/python -m pytest ",
+    "tests/test_deploy_scripts.py::test_archive_excludes_secrets_and_state -q 2>&1 | tail -18",
+    `</parameter>`,
+    "\n</invoke>\n",
+  )
+
+  test("§22-gap: the real leak is currently NOT recovered (documents the escape)", () => {
+    // Bite proof, mirroring §18.3: this asserts the CURRENT (broken) behaviour so
+    // the fix flips it. When the §22.6 rescue lands, this test must be updated to
+    // expect recoveredCalls=1 and this expectation deleted.
+    const r = parseDsml(realLeak)
+    expect(r.calls).toHaveLength(0)
+    expect(r.ranges).toHaveLength(0) // looksLikeDsml() short-circuits: no marker at all
+  })
+
+  test("§22-discriminator: a trailing orphan `</invoke>` is the authenticity signal", () => {
+    // The only near-conclusive signal that this markerless `<parameter>` is a
+    // real call, not prose (§22.5 signal 1). Asserted here so the fix has a
+    // documented hook; prose does not close an invoke it never opened.
+    expect(realLeak).toContain(`</invoke>`)
+  })
+
+  test("§21 regression guard: quoted markerless prose must stay untouched", () => {
+    // The §22 fix must NOT reopen §21 (the fork eating quoted text). Prose that
+    // merely mentions `<parameter name="…">` with no orphan invoke closer must
+    // remain byte-identical and recover zero calls.
+    const prose = text(
+      "An HTML ",
+      `<parameter name="foo">`,
+      " element is not a DSML tool call.",
+    )
+    const r = parseDsml(prose)
+    expect(r.calls).toHaveLength(0)
+    expect(r.ranges).toHaveLength(0)
+  })
+})
+
 describe("parseDsml — reject arms", () => {
   test("reject-no-marker", () => {
     expect(parseDsml("hello world")).toEqual({ calls: [], ranges: [] })
