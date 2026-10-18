@@ -144,6 +144,47 @@ export default Plugin.define({
       })
     }
 
+    // --- Wire probe: the ACTUAL outbound tools array --------------------------
+    // Second measurement point for the `tools` question. The `context` hook
+    // (below) reads the tools BEFORE OpenCode finishes assembling the request;
+    // `http.request` fires at dispatch and hands us the real `Request`. Reading
+    // the body from a CLONE (never the original — that would break inference)
+    // tells us whether the tools array survives request assembly. Comparing the
+    // two counts localises a drop: context tools>0 but wire tools=0 → OpenCode
+    // itself; both >0 but the model still leaks → downstream (provider/network).
+    // Observer only, gated behind `debug`; never mutates the request.
+    await ctx.session.hook("http.request", (event) => {
+      if (!config.debug) return
+      if (!appliesToProvider(config, event.model.providerID)) return
+      if (event.kind !== "primary") return
+      const label = `${event.sessionID}/wire`
+      // Fire-and-forget: the hook must return without awaiting the read, or it
+      // serialises the outbound request. Log when the clone resolves.
+      void (async () => {
+        try {
+          const body = (await event.request.clone().json()) as {
+            tools?: unknown
+            messages?: unknown
+          }
+          const tools = Array.isArray(body.tools) ? body.tools : undefined
+          const count = tools ? tools.length : 0
+          const names = tools
+            ? tools
+                .map((t) => {
+                  const fn = (t as { function?: { name?: unknown } }).function
+                  const name = fn?.name ?? (t as { name?: unknown }).name
+                  return typeof name === "string" ? name : "?"
+                })
+                .join(",")
+            : ""
+          const msgCount = Array.isArray(body.messages) ? body.messages.length : 0
+          log(`wire ${label} tools=${count} names=[${names}] messages=${msgCount}`)
+        } catch (error) {
+          log(`wire ${label} body-unreadable ${error instanceof Error ? error.message : String(error)}`)
+        }
+      })()
+    })
+
     // --- Live response fix: SSE rewrite on the native protocol path ------------
     // Catalog providers such as opencode-go resolve to the NATIVE
     // openai-compatible route, where `aisdk.language` never fires. The native
@@ -245,11 +286,15 @@ export default Plugin.define({
         }
       }
       // One line per request turn: what each request layer actually did.
-      if (sanitizedMsgs > 0 || nudge) {
-        log(
-          `request ${label} sanitized=${sanitizedMsgs}msgs/${sanitizedParts}parts nudge=${nudge ? "yes" : "no"}`,
-        )
-      }
+      // `tools` is the outbound tool count — logged UNCONDITIONALLY so a
+      // tools=0 turn that sanitized/nudged nothing is still recorded. This is
+      // the field needed to test the upstream claim that malformed DSML
+      // clusters on requests with zero tools: join this line to the `response`
+      // lines for the same `label` (they share session/message#attempt).
+      const toolCount = event.tools ? Object.keys(event.tools).length : 0
+      log(
+        `request ${label} tools=${toolCount} sanitized=${sanitizedMsgs}msgs/${sanitizedParts}parts nudge=${nudge ? "yes" : "no"}`,
+      )
     })
 
     // --- Retry: one wake per stalled step ---------------------------------------
