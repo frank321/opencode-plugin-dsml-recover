@@ -6,9 +6,9 @@
       "name": "opencode-plugin-dsml",
       "dependencies": {
         "@ai-sdk/provider": "^3.0.8",
+        "@opencode/plugin": "2.0.22",
       },
       "devDependencies": {
-        "@opencode/plugin": "2.0.22",
         "bun-types": "latest",
         "typescript": "^5.6.0",
       },
