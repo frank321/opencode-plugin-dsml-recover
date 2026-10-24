@@ -143,17 +143,17 @@ describe("settled stats", () => {
   })
 
   test("sse rewriter reports pure passthrough", () => {
-    const seen: Array<{ calls: number; sawCandidate: boolean; redacted?: boolean }> = []
+    const seen: Array<{ calls: number; sawCandidate: boolean; redacted?: boolean; looping?: boolean }> = []
     const rewriter = new SseDsmlRewriter({ onSettled: (s) => seen.push(s) })
     rewriter.push(sseText("plain text here") + sseFinish("stop"))
     rewriter.flush()
     expect(seen).toHaveLength(1)
     // Pure passthrough: nothing held, nothing recovered, nothing redacted.
-    expect(seen[0]).toEqual({ calls: 0, sawCandidate: false, redacted: false })
+    expect(seen[0]).toEqual({ calls: 0, sawCandidate: false, redacted: false, looping: false })
   })
 
   test("middleware reports settled stats", async () => {
-    const seen: Array<{ calls: number; sawCandidate: boolean; redacted?: boolean }> = []
+    const seen: Array<{ calls: number; sawCandidate: boolean; redacted?: boolean; looping?: boolean }> = []
     const middleware = createDsmlStreamMiddleware({ onSettled: (s) => seen.push(s) })
     const source = new ReadableStream<LanguageModelV3StreamPart>({
       start(c) {
@@ -176,7 +176,7 @@ describe("settled stats", () => {
       const { done } = await reader.read()
       if (done) break
     }
-    expect(seen).toEqual([{ calls: 0, sawCandidate: false, redacted: false }])
+    expect(seen).toEqual([{ calls: 0, sawCandidate: false, redacted: false, looping: false }])
   })
 })
 

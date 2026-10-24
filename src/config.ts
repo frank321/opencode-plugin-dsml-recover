@@ -96,6 +96,16 @@ export interface DsmlPluginOptions {
    * Observer only: never changes what is emitted. Default false.
    */
   capture?: boolean
+  /**
+   * Degenerate-repetition guard (second failure mode, 2026-10-23): collapse
+   * `"Let me do it"`-style loop filler and wake the session when a turn stalls
+   * on it. Distinct from the DSML parser — the loop carries no markup, so it
+   * always logged `passthrough` before. Conservative: fires only on a long text
+   * block that is overwhelmingly one repeated line (or near-flat vocabulary);
+   * normal prose, code, tables, and logs never trip it.
+   * Default false: opt-in, and never collapses non-degenerate text.
+   */
+  loopGuard?: boolean
 }
 
 export interface ResolvedDsmlConfig {
@@ -114,6 +124,7 @@ export interface ResolvedDsmlConfig {
   readonly retryChannel: "system" | "user"
   readonly debug: boolean
   readonly capture: boolean
+  readonly loopGuardEnabled: boolean
 }
 
 const DEFAULT_PROVIDERS = ["opencode-go", "opencode"] as const
@@ -152,6 +163,7 @@ export function resolveConfig(input: DsmlPluginOptions = {}): ResolvedDsmlConfig
     retryChannel: retry.channel ?? "system",
     debug: input.debug ?? false,
     capture: input.capture ?? false,
+    loopGuardEnabled: input.loopGuard ?? false,
   }
 }
 

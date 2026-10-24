@@ -12,7 +12,7 @@
 
 import { looksLikeDsml } from "./grammar.ts"
 import { parseDsml, type ParseOptions } from "./parse.ts"
-import { recoveryNudge } from "./prompt.ts"
+import { loopNudge, recoveryNudge } from "./prompt.ts"
 
 export interface FallbackDecision {
   /** Whether to send the nudge. */
@@ -106,18 +106,35 @@ export function needsSystemNudge(
  *
  * @param text the latest assistant text
  * @param alreadySent whether a nudge/wake was already sent for this message
+ * @param redactionSeen whether the live fix redacted unrecoverable markup this
+ *   turn (the marker is then gone from the stored text, §22)
+ * @param loopSeen whether the live fix flagged this turn as a degenerate
+ *   repetition loop. Fires with or without a marker: the loop is a stall on
+ *   its own. The nudge text differs — a loop must be broken by demanding one
+ *   concrete action, not by re-explaining the markup grammar.
  */
-export function decideResume(text: string, alreadySent: boolean, redactionSeen = false): FallbackDecision {
-  // `redactionSeen`: this session's live fix REDACTED markup it could not
-  // recover. The redaction erased the DSML marker from the stored text, so
-  // `looksLikeDsml` is false and the normal trigger would never fire — but the
-  // turn genuinely stalled, so the wake is still warranted (§22).
-  if (!redactionSeen && !looksLikeDsml(text)) return { send: false, reason: "no-marker" }
-  if (looksLikeDsml(text) && parseDsml(text).calls.length > 0) {
+export function decideResume(
+  text: string,
+  alreadySent: boolean,
+  redactionSeen = false,
+  loopSeen = false,
+): FallbackDecision {
+  const marker = looksLikeDsml(text)
+  // Recoverable markup needs no wake at all: the turn did not stall.
+  if (marker && parseDsml(text).calls.length > 0) {
     return { send: false, reason: "already-recoverable" }
   }
+  // `redactionSeen`: this session's live fix REDACTED markup it could not
+  // recover, which erased the marker from the stored text — the wake is still
+  // warranted (§22). `loopSeen`: the turn degenerated into repeated filler,
+  // marker or not — same conclusion.
+  if (!marker && !redactionSeen && !loopSeen) return { send: false, reason: "no-marker" }
   if (alreadySent) return { send: false, reason: "already-sent" }
-  return { send: true, text: recoveryNudge() }
+  // Which correction to send: when a marker (or a redaction that erased one) is
+  // in play the stall was markup, so the grammar fixer applies. Only a PURE
+  // loop — no markup anywhere — gets the action-demand wake.
+  const pureLoop = !marker && !redactionSeen && loopSeen
+  return { send: true, text: pureLoop ? loopNudge() : recoveryNudge() }
 }
 
 /** Extract readable text from an OpenCode session-context message. */

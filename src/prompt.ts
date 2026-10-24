@@ -24,6 +24,22 @@ export function recoveryNudge(toolHint?: string): string {
   ].join(" ")
 }
 
+/**
+ * Loop-breaker wake, sent when a turn ends in degenerate repetition (the same
+ * sentence re-emitted many times) instead of a tool call. Model-facing text: no
+ * live DSML token, imperative, and explicit about what to do instead — one
+ * concrete action, not a restatement of intent. Restating intent is exactly
+ * what produced the loop.
+ */
+export function loopNudge(): string {
+  return [
+    "Your previous reply repeated the same sentence many times instead of",
+    "taking an action, so nothing moved forward. Do not narrate what you are",
+    "about to do. Choose the single most useful concrete action for the current",
+    "task and emit it now as one tool call.",
+  ].join(" ")
+}
+
 /** Guard used by tests: model-facing text must contain no live marker. */
 export function containsLiveMarker(text: string): boolean {
   return /[\uFF5C|]\s*DSML\s*[\uFF5C|]/i.test(text)

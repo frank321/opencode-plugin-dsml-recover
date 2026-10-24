@@ -23,6 +23,7 @@ import type {
 } from "@ai-sdk/provider"
 import { parseDsml, redactionNote, stripRangesWithNote, type DsmlToolCall, type ParseOptions } from "./parse.ts"
 import { captureDelta, captureDrain, captureEmit, type DrainDecision } from "./debug-capture.ts"
+import { collapseLoop, detectLoop } from "./loopguard.ts"
 
 export interface DsmlMiddlewareOptions extends ParseOptions {
   /** Streaming swallow cap in bytes. Default 65536. */
@@ -31,6 +32,13 @@ export interface DsmlMiddlewareOptions extends ParseOptions {
   readonly stream?: boolean
   /** Enable non-streaming generate recovery. Default true. */
   readonly generate?: boolean
+  /**
+   * Suppress degenerate repetition loops (the `"Let me do it"` failure). When a
+   * resolved text block is flagged by `detectLoop`, the repeated tail is
+   * collapsed to a short marker. Off by default: this is a second, independent
+   * behaviour and must be opted into explicitly.
+   */
+  readonly loopGuard?: boolean
   /** Called once when the stream ends, with the per-turn outcome. */
   readonly onSettled?: (stats: DsmlStats) => void
   /** LOCAL FORK: write capture records to /tmp/opencode/dsml-capture.log. */
@@ -50,6 +58,13 @@ export interface DsmlStats {
    * fire without this signal (§22). Default false.
    */
   readonly redacted?: boolean
+  /**
+   * Whether this turn was flagged as a degenerate repetition loop. Like
+   * `redacted`, this is a wake signal: a loop that stalls the turn may carry no
+   * DSML marker at all, so the retry safety net has nothing else to key on.
+   * Default false.
+   */
+  readonly looping?: boolean
 }
 
 const DEFAULT_BUFFER_LIMIT = 64 * 1024
@@ -124,6 +139,14 @@ function holdStart(buffer: string): number {
  */
 const EAGER_WINDOW = 1024
 
+/**
+ * Loop-guard deferred window (chars). Plain text on the no-candidate path is
+ * held until it reaches this size before an emit decision, so `detectLoop` has
+ * enough context to tell filler from prose. Tuned just above `detectLoop`'s
+ * MIN_LENGTH plus a few deltas; only in effect when `loopGuard` is enabled.
+ */
+const LOOP_WINDOW = 1024
+
 /** A complete parameter open tag exists in the held text: we may be inside a value. */
 const PARAM_OPEN = /<[\uFF5C|]{1,2}\s*DSML\s*[\uFF5C|]{1,2}\s*parameter\s+name\s*=/iu
 
@@ -150,6 +173,7 @@ export function recoverFromText(
 export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): LanguageModelV3Middleware {
   const bufferLimit = input?.bufferLimit ?? DEFAULT_BUFFER_LIMIT
   const captureOn = input?.capture ?? false
+  const loopGuardOn = input?.loopGuard ?? false
   const parseOptions: ParseOptions = {
     orphanInvoke: input?.orphanInvoke,
     looseParameters: input?.looseParameters,
@@ -169,6 +193,7 @@ export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): Langu
       let recoveredInBlock = false
       let sawCandidate = false
       let redacted = false
+      let looping = false
       let settled = false
       let counter = 0
 
@@ -201,7 +226,7 @@ export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): Langu
       const settle = () => {
         if (settled) return
         settled = true
-        input?.onSettled?.({ calls: counter, sawCandidate, redacted })
+        input?.onSettled?.({ calls: counter, sawCandidate, redacted, looping })
       }
 
       const enqueueCall = (controller: TransformStreamDefaultController<LanguageModelV3StreamPart>, call: DsmlToolCall) => {
@@ -261,6 +286,29 @@ export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): Langu
             return
           }
           captureDrain(captureOn, "aisdk", decision("emit-plain", false, false, false, final, start), textBuffer)
+          // Second failure mode (loopguard): the model collapses into repeating
+          // one sentence ("Let me do it"), carries no markup, and streams out as
+          // many small deltas. To classify it we cannot emit each delta eagerly —
+          // hold plain text in a bounded window, then flush once we can tell it
+          // is (or is not) degenerate. Normal prose is emitted on the next delta
+          // past the window or at finality, so the added latency is bounded.
+          if (loopGuardOn && !final && textBuffer.length < LOOP_WINDOW) {
+            return
+          }
+          const drainLoop = loopGuardOn ? detectLoop(textBuffer) : undefined
+          if (drainLoop?.looping) {
+            looping = true
+            captureEmit(captureOn, "aisdk", "loop-collapsed", collapseLoop(textBuffer, drainLoop), {
+              final,
+              reason: drainLoop.reason,
+              repeats: drainLoop.repeats,
+              uniqueRatio: drainLoop.uniqueRatio,
+              originalLen: textBuffer.length,
+            })
+            controller.enqueue({ type: "text-delta", id: textId, delta: collapseLoop(textBuffer, drainLoop) })
+            textBuffer = ""
+            return
+          }
           controller.enqueue({ type: "text-delta", id: textId, delta: textBuffer })
           textBuffer = ""
           return
@@ -368,6 +416,22 @@ export function createDsmlStreamMiddleware(input?: DsmlMiddlewareOptions): Langu
             recoveredCalls: 0,
             cap: bufferLimit,
           })
+          // Second failure mode (loopguard): plain prose with no markup at all,
+          // but degenerate. Collapse before it reaches the transcript; the
+          // unmodified text is never used here once the guard fires.
+          const loop = loopGuardOn ? detectLoop(original) : undefined
+          if (loop?.looping) {
+            looping = true
+            captureEmit(captureOn, "aisdk", "loop-collapsed", collapseLoop(original, loop), {
+              final: isFinal,
+              reason: loop.reason,
+              repeats: loop.repeats,
+              uniqueRatio: loop.uniqueRatio,
+              originalLen: original.length,
+            })
+            controller.enqueue({ type: "text-delta", id: textId, delta: collapseLoop(original, loop) })
+            return
+          }
           controller.enqueue({ type: "text-delta", id: textId, delta: original })
           return
         }

@@ -93,6 +93,11 @@ export default Plugin.define({
     // stored transcript no longer contains a DSML marker (redaction erases it).
     const redactedSessions = new Set<string>()
 
+    // Sessions whose most recent primary response was a degenerate repetition
+    // loop (the second failure mode). Like `redactedSessions`, a wake signal:
+    // the loop carries no DSML marker, so nothing else keys the retry net.
+    const loopingSessions = new Set<string>()
+
     // --- Live response fix: model recovery ------------------------------------
     if (config.responseFixEnabled) {
       await ctx.aisdk.hook("language", (event) => {
@@ -128,6 +133,7 @@ export default Plugin.define({
           generate: true,
           bufferLimit: config.bufferLimit,
           capture: config.capture,
+          loopGuard: config.loopGuardEnabled,
           onSettled: (stats) => {
             const what =
               stats.calls > 0
@@ -137,7 +143,10 @@ export default Plugin.define({
                   : stats.sawCandidate
                     ? "held-candidate-no-call"
                     : "passthrough"
-            log(`response model=${event.model.providerID}/${event.model.id} ${what}`)
+            // The loop is a wake signal even when nothing else fired. NB: this
+            // hook carries no session id (see above), so loop-wake tracking is
+            // only possible on the SSE route below — here we can only log it.
+            log(`response model=${event.model.providerID}/${event.model.id} ${what}${stats.looping ? " LOOP" : ""}`)
           },
         })
         log("wrapped language model for", event.model.providerID, event.model.id)
@@ -204,10 +213,13 @@ export default Plugin.define({
             ...parseOptionsFor(sessionID),
             bufferLimit: config.bufferLimit,
             capture: config.capture,
+            loopGuard: config.loopGuardEnabled,
             onSettled: (stats) => {
               // Remember a redaction so the idle wake still fires for this
               // session despite the marker having been erased from the text.
               if (stats.redacted) redactedSessions.add(sessionID)
+              // Likewise a degenerate loop: the wake fires on the stall signal.
+              if (stats.looping) loopingSessions.add(sessionID)
               const what =
                 stats.calls > 0
                   ? `recovered=${stats.calls}`
@@ -216,7 +228,7 @@ export default Plugin.define({
                     : stats.sawCandidate
                       ? "held-candidate-no-call"
                       : "passthrough"
-              log(`response ${label} ${what}`)
+              log(`response ${label} ${what}${stats.looping ? " LOOP" : ""}`)
             },
           })
         } catch (error) {
@@ -319,8 +331,8 @@ export default Plugin.define({
           // no other signal survives). Avoids a context() read on every normal
           // turn. A marker-bearing transcript is still caught by the context
           // hook's nudge, so this does not lose coverage.
-          if (!redactedSessions.has(sessionID) && !legacyIdle) continue
-          await maybeWake(ctx, config, log, sessionID, redactedSessions).catch((error) =>
+          if (!redactedSessions.has(sessionID) && !loopingSessions.has(sessionID) && !legacyIdle) continue
+          await maybeWake(ctx, config, log, sessionID, redactedSessions, loopingSessions).catch((error) =>
             log("wake failed", error),
           )
         }
@@ -369,6 +381,7 @@ async function maybeWake(
   log: (...args: unknown[]) => void,
   sessionID: string,
   redactedSessions: Set<string>,
+  loopingSessions: Set<string>,
 ): Promise<void> {
   const messages = await ctx.session.context({ sessionID })
   const last = [...messages].reverse().find((message) => message.type === "assistant")
@@ -381,13 +394,17 @@ async function maybeWake(
   const key = attemptKey(sessionID, last.id)
   const sent = alreadySent(await ctx.storage.get(key))
   const redactionSeen = redactedSessions.has(sessionID)
-  const decision = decideResume(text, sent, redactionSeen)
+  // The loop guard's wake: the last assistant text is degenerate filler. Unlike
+  // the marker path this needs no DSML detection — `decideResume` checks it.
+  const loopSeen = loopingSessions.has(sessionID)
+  const decision = decideResume(text, sent, redactionSeen, loopSeen)
   if (!decision.send || !decision.text) {
     if (decision.reason && decision.reason !== "no-marker") log(decision.reason, "for", last.id)
     return
   }
-  // Clear the flag once consumed so a later unrelated idle does not re-wake.
+  // Clear the flags once consumed so a later unrelated idle does not re-wake.
   redactedSessions.delete(sessionID)
+  loopingSessions.delete(sessionID)
   await ctx.storage.set(key, true)
   if (config.retryChannel === "user") {
     // The full correction travels as a synthetic user turn.

@@ -129,3 +129,36 @@ the test table covers both.
   empty and no text is ever lost.
 - Trailing markup noise (`</invoke>` / `</calls>` arriving after an already
   recovered call) is dropped, not leaked.
+
+## 6. Loop degeneracy — a failure mode with NO markup (2026-10-23)
+
+Found live: DeepSeek V4.1 (DeepInfra) at ~520k cached context during a 688-turn
+coding session. Distinct from every variant in §2: there is no
+markup anywhere, so the parser and this document's grammar never apply and every
+turn logs `passthrough`.
+
+- **Shape.** One short imperative sentence re-emitted dozens of times inside a
+  single assistant text part ("Let me do it.", "OK.", "Running:"). Observed at
+  39, 37, 100 and 93 repeats; early turns carried a valid `shell` tool call
+  alongside the filler (`finish=tool-calls`), later turns degraded to
+  `finish=stop` with NO tool call — the true stall — often ending with an
+  apology that promised a tool call that never came.
+- **Why it loops.** Each turn's output is narrated intent only; no tool result
+  ever lands, so the next request replays the same state and the model regenerates
+  the same scaffolding. Long idle polls (`sleep 1500; ssh …`) between turns fed
+  near-identical context repeatedly.
+- **Recovery is impossible from the bytes.** In the `stop` turns there is no
+  call to recover — suppression (collapse the filler) and interruption
+  (action-demand wake) are the only levers. In the `tool-calls` turns the call
+  already executes; suppressing the filler is cosmetic but stops the transcript
+  pollution that reinforces the pattern.
+- **Guard (`src/loopguard.ts`, `loopGuard` option, off by default).** Detector:
+  a block ≥300 chars whose most-common non-blank line repeats ≥8×, or ≥800 chars
+  with <15% unique lines. Tuned so the real corpus flags exactly its 6 loop
+  messages out of 688, and normal prose, code, tables, and tool-result logs pass
+  clean. Emission: plain text is held in a bounded 1 KiB window on the
+  no-candidate path so classification can happen before the filler streams out;
+  collapsed text keeps the leading intent line plus one `[loop suppressed]`
+  marker. Wake: like the §22 redaction signal, the loop flags the session so
+  `decideResume` fires — a pure loop gets `loopNudge()` (demand one concrete
+  action), never the markup fixer.

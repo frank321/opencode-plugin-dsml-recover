@@ -21,10 +21,13 @@
 
 import { parseDsml, redactionNote, stripRangesWithNote, type DsmlToolCall, type ParseOptions } from "./parse.ts"
 import { captureDelta, captureDrain, captureEmit, type DrainDecision } from "./debug-capture.ts"
+import { collapseLoop, detectLoop } from "./loopguard.ts"
 
 export interface SseRewriterOptions extends ParseOptions {
   /** Streaming swallow cap in bytes. Default 65536. */
   readonly bufferLimit?: number
+  /** Suppress degenerate repetition loops (the `"Let me do it"` failure). Default false. */
+  readonly loopGuard?: boolean
   /** Called once when the stream closes, with the per-turn outcome. */
   readonly onSettled?: (stats: SseStats) => void
   /** LOCAL FORK: write capture records to /tmp/opencode/dsml-capture.log. */
@@ -45,10 +48,18 @@ export interface SseStats {
    * the live fix failed to recover (§22). Default false.
    */
   readonly redacted?: boolean
+  /**
+   * Whether this turn was flagged as a degenerate repetition loop. A wake
+   * signal like `redacted`: the loop may carry no DSML marker, so the retry
+   * safety net has nothing else to key on. Default false.
+   */
+  readonly looping?: boolean
 }
 
 const DEFAULT_BUFFER_LIMIT = 64 * 1024
 const EAGER_WINDOW = 1024
+/** Loop-guard deferred window (chars); see middleware.ts for rationale. */
+const LOOP_WINDOW = 1024
 
 const WRAPPED_CANDIDATE = /<(?:[\uFF5C|]{1,2}\s*DSML\s*[\uFF5C|]{1,2}\s*)?parameter\s+name\s*=\s*["']?[^\s>"']+/iu
 const DSML_OPENER = /<[\uFF5C|]{1,2}\s*DSML/iu
@@ -160,13 +171,16 @@ export class SseDsmlRewriter {
   private sawCandidate = false
   private settled = false
   private redacted = false
+  private looping = false
   private readonly bufferLimit: number
+  private readonly loopGuardOn: boolean
   private readonly parseOptions: ParseOptions
   private readonly onSettled?: (stats: SseStats) => void
   private readonly captureOn: boolean
 
   constructor(input?: SseRewriterOptions) {
     this.bufferLimit = input?.bufferLimit ?? DEFAULT_BUFFER_LIMIT
+    this.loopGuardOn = input?.loopGuard ?? false
     this.onSettled = input?.onSettled
     this.captureOn = input?.capture ?? false
     this.parseOptions = {
@@ -187,7 +201,7 @@ export class SseDsmlRewriter {
   settle(): void {
     if (this.settled) return
     this.settled = true
-    this.onSettled?.({ calls: this.toolIndex, sawCandidate: this.sawCandidate, redacted: this.redacted })
+    this.onSettled?.({ calls: this.toolIndex, sawCandidate: this.sawCandidate, redacted: this.redacted, looping: this.looping })
   }
 
   /** Feed upstream bytes; returns rewritten SSE frames to send downstream. */
@@ -301,6 +315,21 @@ export class SseDsmlRewriter {
         recoveredCalls: 0,
         cap: this.bufferLimit,
       })
+      // Loopguard: plain prose with no markup, but degenerate. Collapse it.
+      const loop = this.loopGuardOn ? detectLoop(original) : undefined
+      if (loop?.looping) {
+        this.looping = true
+        const collapsed = collapseLoop(original, loop)
+        captureEmit(this.captureOn, "sse", "loop-collapsed", collapsed, {
+          final,
+          reason: loop.reason,
+          repeats: loop.repeats,
+          uniqueRatio: loop.uniqueRatio,
+          originalLen: original.length,
+        })
+        this.emitText(collapsed, out)
+        return
+      }
       this.emitText(original, out)
       return
     }
@@ -395,6 +424,27 @@ export class SseDsmlRewriter {
         return out
       }
       captureDrain(this.captureOn, "sse", this.decision("emit-plain", false, false, false, final, start), this.textBuffer)
+      // Loopguard: hold plain text in a bounded window before the emit
+      // decision, so detectLoop has enough context to classify it. Normal
+      // prose flushes on the next delta past the window or at finality.
+      if (this.loopGuardOn && !final && this.textBuffer.length < LOOP_WINDOW) {
+        return out
+      }
+      const drainLoop = this.loopGuardOn ? detectLoop(this.textBuffer) : undefined
+      if (drainLoop?.looping) {
+        this.looping = true
+        const collapsed = collapseLoop(this.textBuffer, drainLoop)
+        captureEmit(this.captureOn, "sse", "loop-collapsed", collapsed, {
+          final,
+          reason: drainLoop.reason,
+          repeats: drainLoop.repeats,
+          uniqueRatio: drainLoop.uniqueRatio,
+          originalLen: this.textBuffer.length,
+        })
+        this.emitText(collapsed, out)
+        this.textBuffer = ""
+        return out
+      }
       this.emitText(this.textBuffer, out)
       this.textBuffer = ""
       return out
